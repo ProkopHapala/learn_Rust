@@ -1,0 +1,10 @@
+[package]
+name = "demo06_opencl_opengl_interop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ocl = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+rand = { workspace = true }

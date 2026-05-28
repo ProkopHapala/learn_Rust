@@ -1,0 +1,12 @@
+[package]
+name = "demo04_wgpu_compute"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+winit = { workspace = true }
+rand = { workspace = true }
+

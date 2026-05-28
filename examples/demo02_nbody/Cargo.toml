@@ -1,0 +1,10 @@
+[package]
+name = "demo02_nbody"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+nalgebra = { workspace = true }
+rand = { workspace = true }

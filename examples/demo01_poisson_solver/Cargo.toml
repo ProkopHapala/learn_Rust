@@ -1,0 +1,10 @@
+[package]
+name = "demo01_poisson_solver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_plot = { workspace = true }
+ndarray = { workspace = true }
