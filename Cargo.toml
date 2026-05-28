@@ -6,6 +6,7 @@ members = [
     "examples/demo04_wgpu_compute",
     "examples/demo05_pointer_reinterpret",
     "examples/demo06_opencl_opengl_interop",
+    "examples/demo07_uff_forcefield",
 ]
 resolver = "2"
 
