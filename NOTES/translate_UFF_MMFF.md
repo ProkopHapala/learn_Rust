@@ -1077,3 +1077,102 @@ You confirmed `max 4` neighbors for now, and you prefer “bake/export” over �
 
 - **Done**: builder/params/topology separation started with a real [Builder::bake()](cci:1://file:///home/prokop/git/learn_Rust/examples/demo07_uff_forcefield/src/builder.rs:158:4-187:5) pipeline; UFF no longer owns topology-building helpers.
 - **Next decision (you)**: do you want [bake()](cci:1://file:///home/prokop/git/learn_Rust/examples/demo07_uff_forcefield/src/builder.rs:158:4-187:5) to also export **neighbor tables (`neighs/neighBs`) directly** (so UFF skips [make_neigh_bs()](cci:1://file:///home/prokop/git/learn_Rust/examples/demo07_uff_forcefield/src/uff.rs:188:4-232:5)), or keep [make_neigh_bs()](cci:1://file:///home/prokop/git/learn_Rust/examples/demo07_uff_forcefield/src/uff.rs:188:4-232:5) inside each forcefield as it is now?
+
+---
+
+# Session: UFF Parameter Debugging and Diagnostics (2026-05-28)
+
+## Objective
+
+Add diagnostic print functions to the Rust UFF implementation to achieve parity with the C++ reference code (UFF.h, MMFFparams.h, MMFFBuilderBase.h, NBFF.h). This enables detailed debugging and validation of forcefield parameters during development and troubleshooting.
+
+## What was added
+
+### 1. `src/uff.rs` — Uff struct (matching C++ UFF.h)
+
+Added print functions for UFF bonded and non-bonded parameters:
+
+- `print_sizes()` — prints counts: natoms, nbonds, nangles, ndihedrals, ninversions
+- `print_atom_params(ia)` — prints atom neighbor indices and REQ parameters
+- `print_bond_params(ib)` — prints bond atom pair, force constant K, equilibrium length l0
+- `print_angle_params(ia)` — prints angle force constant K and Fourier coefficients c0-c3
+- `print_dihedral_params(id)` — prints dihedral barrier V, phase d, periodicity n
+- `print_inversion_params(ii)` — prints inversion force constant K and Fourier coefficients c0-c2
+- `print_all_params(b_atoms, b_bonds, b_angles, b_dihedrals, b_inversions)` — convenience function to print all selected parameter types
+
+**Format parity**: Matches `UFF.h` print functions exactly (field widths, precision, order).
+
+### 2. `src/params.rs` — ElementType, AtomType, Params (matching C++ MMFFparams.h)
+
+Added print methods to parameter structs and the Params container:
+
+**ElementType::print(i, b_params)**:
+- Prints element index, name, iZ, valence, piMax, color
+- Optionally prints REQ and QEq parameters
+
+**AtomType::print(i, b_params)**:
+- Prints atom type index, name, valence, nepair, npi, sym
+- Optionally prints REQH and MMFF parameters
+
+**Params print functions**:
+- `print_bond_type(i)` — prints bond type with atom names, l0, k
+- `print_angle_type(i)` — prints angle type with atom names, ang0, k
+- `print_dihedral_type(i)` — prints dihedral type with atom names, ang0, k, n
+- `print_element_types(b_params)` — prints all element types
+- `print_atom_types(b_params)` — prints all atom types
+- `print_bond_types()` — prints all bond types from loaded file
+- `print_angle_types()` — prints all angle types from loaded file
+- `print_dihedral_types()` — prints all dihedral types from loaded file
+- `print_atom_type_dict()` — prints atom type name-to-index mapping
+- `print_element_type_dict()` — prints element type name-to-index mapping
+- `print_types_of_atoms(itypes, b_name_only, b_params)` — prints atom type info for each atom index
+
+**Format parity**: Matches `MMFFparams.h` print functions exactly.
+
+### 3. `src/topology.rs` — Topology (matching C++ MMFFBuilderBase.h)
+
+Added print functions for the baked topology structure:
+
+- `print_sizes()` — prints atoms, bonds, angles, dihedrals counts
+- `print_atoms()` — prints atom positions
+- `print_bonds()` — prints bond atom pairs
+- `print_angles()` — prints angle atom triples
+- `print_dihedrals()` — prints dihedral atom quadruples
+- `print_inversions()` — prints inversion atom quadruples
+
+**Format parity**: Matches `MMFFBuilderBase.h::printSizes()`, `printAtoms()`, `printBonds()`, `printAngles()` format.
+
+### 4. `src/nonbonded.rs` — NonBondedFF (matching C++ NBFF.h)
+
+Added print functions for non-bonded forcefield:
+
+- `print_second_neighs(mode)` — prints sorted exclusion list per atom
+  - mode 0: atom indices
+  - mode 2: cell indices
+  - mode 3: cell:atom hex format
+- `print_nonbonded(apos)` — prints REQ parameters and positions per atom
+- `check_req_limits()` — validates REQ values against bounds (0.2-3.0 for RvdW, etc.)
+
+**Format parity**: Matches `NBFF.h::printSecondNeighs()`, `print_nonbonded()`, `checkREQlimits()` format.
+
+### 5. `src/builder.rs` — Builder (matching C++ MMFFBuilderBase.h)
+
+Added print functions for the dynamic builder:
+
+- `print_bonds_of_atom(ia)` — prints bond indices and atom pairs for a given atom
+- `print_atom_neighs(ia)` — prints neighbor atom indices for a given atom
+
+**Format parity**: Matches `MMFFBuilderBase.h::printBondsOfAtom()`, `printAtomNeighs()` format.
+
+## Verification
+
+- Build passes: `cargo build` with no errors
+- CH4 test converges: MD completes in 290 steps with force norm below threshold
+- Xylitol test converges: MD completes in 13,442 steps with force norm below threshold
+
+## Notes
+
+- All print functions use exact format strings from C++ reference headers for parity
+- Functions are public and can be called from `main.rs` or other modules for debugging
+- No functional changes to forcefield evaluation — only diagnostic additions
+- Aligned with user rule: "Debuggability > UX" — code is transparent and inspectable

@@ -1,0 +1,10 @@
+[package]
+name = "demo07_uff_forcefield"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { workspace = true }
+
+[profile.release]
+debug = true

@@ -156,6 +156,42 @@ impl Builder {
         s.gen == a.gen && s.val.is_some()
     }
 
+    // ================== MM::Builder diagnostic prints (parity with C++ MMFFBuilderBase.h) ==================
+
+    pub fn print_bonds_of_atom(&self, ia: usize) {
+        let ad = match &self.atoms[ia].val {
+            Some(a) => a,
+            None => { println!("printBondsOfAtom({}): atom is dead", ia); return; }
+        };
+        print!("printBondsOfAtom({}): ", ia);
+        for i in 0..ad.nbond as usize {
+            let bh = ad.neigh_bonds[i];
+            if bh.gen == 0 { continue; }
+            let bd = self.bond(bh);
+            print!("({}|{:3},{:3}) ", bh.idx, bd.a.idx, bd.b.idx);
+        }
+        println!();
+    }
+
+    pub fn print_atom_neighs(&self, ia: usize) {
+        let ad = match &self.atoms[ia].val {
+            Some(a) => a,
+            None => { println!("printAtomNeighs({}): atom is dead", ia); return; }
+        };
+        print!("atom[{:3}] nbond({:1}) neighs{{", ia, ad.nbond);
+        for i in 0..4 {
+            if i < ad.nbond as usize {
+                let bh = ad.neigh_bonds[i];
+                let bd = self.bond(bh);
+                let ja = if bd.a.idx == ia as u32 { bd.b.idx } else { bd.a.idx };
+                print!("{:3},", ja);
+            } else {
+                print!(" -1,");
+            }
+        }
+        println!("}}");
+    }
+
     pub fn bake(&mut self) -> Topology {
         // map live atoms to dense indices
         let mut map: Vec<i32> = vec![-1; self.atoms.len()];

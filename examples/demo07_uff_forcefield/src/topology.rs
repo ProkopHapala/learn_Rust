@@ -11,6 +11,48 @@ pub struct Topology {
 
 impl Topology {
     #[inline(always)] pub fn natoms(&self) -> i32 { self.apos.len() as i32 }
+
+    // ================== MM::Builder diagnostic prints (parity with C++ MMFFBuilderBase.h) ==================
+
+    pub fn print_sizes(&self) {
+        println!("sizes: atoms({}|0) bonds({}) angles({}) dihedrals({})",
+                 self.apos.len(), self.bonds.len(), self.angles.len(), self.dihedrals.len());
+    }
+
+    pub fn print_atoms(&self) {
+        println!(" # MM::Builder.printAtoms(na={}) ", self.apos.len());
+        for (i, p) in self.apos.iter().enumerate() {
+            println!("atom[{:3}] pos({:12.6},{:12.6},{:12.6})", i, p.x, p.y, p.z);
+        }
+    }
+
+    pub fn print_bonds(&self) {
+        println!(" # MM::Builder.printBonds(nb={}) ", self.bonds.len());
+        for (i, b) in self.bonds.iter().enumerate() {
+            println!("bond[{:3}] a({:3},{:3})", i, b[0], b[1]);
+        }
+    }
+
+    pub fn print_angles(&self) {
+        println!(" # MM::Builder.printAngles(ng={}) ", self.angles.len());
+        for (i, a) in self.angles.iter().enumerate() {
+            println!("angle[{:3}] a({:3},{:3},{:3})", i, a[0], a[1], a[2]);
+        }
+    }
+
+    pub fn print_dihedrals(&self) {
+        println!(" # MM::Builder.printDihedrals(nd={}) ", self.dihedrals.len());
+        for (i, d) in self.dihedrals.iter().enumerate() {
+            println!("dihedral[{:3}] a({:3},{:3},{:3},{:3})", i, d.x, d.y, d.z, d.w);
+        }
+    }
+
+    pub fn print_inversions(&self) {
+        println!(" # MM::Builder.printInversions(ni={}) ", self.inversions.len());
+        for (i, inv) in self.inversions.iter().enumerate() {
+            println!("inversion[{:3}] a({:3},{:3},{:3},{:3})", i, inv.x, inv.y, inv.z, inv.w);
+        }
+    }
 }
 
 pub fn build_bonds_by_cutoff(apos: &[Vec3d], rcut: f64) -> Vec<[i32; 2]> {

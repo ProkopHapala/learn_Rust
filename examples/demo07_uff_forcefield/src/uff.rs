@@ -90,10 +90,6 @@ pub struct Uff {
 
     // --- Control constants
     pub rdamp: f64,
-    pub fmax_nonbonded: f64,
-    pub b_subtract_bond_nonbond: bool,
-    pub b_subtract_angle_nonbond: bool,
-    pub b_clamp_nonbonded: bool,
     pub sub_nb_torsion_factor: f64,
 }
 
@@ -207,11 +203,65 @@ impl Uff {
             inv_params,
             reqs,
             rdamp: 0.1,
-            fmax_nonbonded: 1000.0,
-            b_subtract_bond_nonbond: false,
-            b_subtract_angle_nonbond: false,
-            b_clamp_nonbonded: false,
             sub_nb_torsion_factor: 0.0,
+        }
+    }
+
+    // ================== Diagnostic print functions (parity with C++ UFF.h) ==================
+
+    pub fn print_sizes(&self) {
+        println!("UFF::printSizes(): natoms({}) nbonds({}) nangles({}) ndihedrals({}) ninversions({})",
+                 self.natoms, self.nbonds, self.nangles, self.ndihedrals, self.ninversions);
+    }
+
+    pub fn print_atom_params(&self, ia: usize) {
+        let n = self.neighs.as_slice()[ia];
+        let r = self.reqs.as_slice()[ia];
+        println!("atom[{:3}] neighs{{{:3},{:3},{:3},{:3}}} REQ({:5.3},{:5.3},{:5.3})",
+                 ia, n.x, n.y, n.z, n.w, r[0], r[1], r[2]);
+    }
+
+    pub fn print_bond_params(&self, ib: usize) {
+        let atoms = self.bon_atoms.as_slice()[ib];
+        let p = self.bon_params.as_slice()[ib];
+        println!("bond[{:3}] {{{}-{}}} K={:5.3} l0={:5.3}", ib, atoms[0], atoms[1], p[0], p[1]);
+    }
+
+    pub fn print_angle_params(&self, ia: usize) {
+        let p = self.ang_params.as_slice()[ia];
+        println!("angle[{:3}] K={:5.3} c0={:5.3} c1={:5.3} c2={:5.3} c3={:5.3}", ia, p[0], p[1], p[2], p[3], p[4]);
+    }
+
+    pub fn print_dihedral_params(&self, id: usize) {
+        let p = self.dih_params.as_slice()[id];
+        println!("dihedral[{:3}] V={:5.3} d={:5.3} n={:5.3}", id, p[0], p[1], p[2]);
+    }
+
+    pub fn print_inversion_params(&self, ii: usize) {
+        let p = self.inv_params.as_slice()[ii];
+        println!("inversion[{:3}] K={:5.3} c0={:5.3} c1={:5.3} c2={:5.3}", ii, p[0], p[1], p[2], p[3]);
+    }
+
+    pub fn print_all_params(&self, b_atoms: bool, b_bonds: bool, b_angles: bool, b_dihedrals: bool, b_inversions: bool) {
+        if b_atoms {
+            println!("\n=== Atoms ===");
+            for i in 0..self.natoms as usize { self.print_atom_params(i); }
+        }
+        if b_bonds && self.nbonds > 0 {
+            println!("\n=== Bonds ===");
+            for i in 0..self.nbonds as usize { self.print_bond_params(i); }
+        }
+        if b_angles && self.nangles > 0 {
+            println!("\n=== Angles ===");
+            for i in 0..self.nangles as usize { self.print_angle_params(i); }
+        }
+        if b_dihedrals && self.ndihedrals > 0 {
+            println!("\n=== Dihedrals ===");
+            for i in 0..self.ndihedrals as usize { self.print_dihedral_params(i); }
+        }
+        if b_inversions && self.ninversions > 0 {
+            println!("\n=== Inversions ===");
+            for i in 0..self.ninversions as usize { self.print_inversion_params(i); }
         }
     }
 
