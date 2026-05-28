@@ -1,4 +1,4 @@
-use crate::math::vec3::Vec3d;
+use mol_utils::math::vec3::Vec3d;
 use crate::topology::{Topology, build_angles_from_bonds, build_dihedrals_from_bonds, build_inversions_from_bonds};
 
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash, Debug)]
@@ -233,6 +233,23 @@ impl Builder {
             for j in (i + 1)..apos.len() {
                 let d = Vec3d::set_sub(apos[j], apos[i]);
                 if d.norm2() < r2cut { b.add_bond(hs[i], hs[j]); }
+            }
+        }
+        b
+    }
+
+    /// Build bonds using element-specific covalent radii with tolerance.
+    /// radii[i] is the covalent radius of atom i (in same units as apos).
+    pub fn from_positions_and_radii(apos: &[Vec3d], radii: &[f64], tol: f64) -> Self {
+        assert_eq!(apos.len(), radii.len(), "apos and radii must have same length");
+        let mut b = Self::new();
+        let mut hs: Vec<AtomH> = Vec::with_capacity(apos.len());
+        for &p in apos { hs.push(b.add_atom(p)); }
+        for i in 0..apos.len() {
+            for j in (i + 1)..apos.len() {
+                let d = Vec3d::set_sub(apos[j], apos[i]);
+                let rcut = radii[i] + radii[j] + tol;
+                if d.norm2() < rcut * rcut { b.add_bond(hs[i], hs[j]); }
             }
         }
         b

@@ -6,6 +6,7 @@ use crate::math::vec3::Vec3d;
 pub struct XyzSystem {
     pub apos: Vec<Vec3d>,
     pub elems: Vec<String>,
+    pub charges: Vec<f64>,
 }
 
 pub fn read_xyz(path: &Path) -> Result<XyzSystem, String> {
@@ -16,18 +17,21 @@ pub fn read_xyz(path: &Path) -> Result<XyzSystem, String> {
 
     let mut apos = Vec::with_capacity(natoms);
     let mut elems = Vec::with_capacity(natoms);
+    let mut charges = Vec::with_capacity(natoms);
     for (iline, line) in it.take(natoms).enumerate() {
         let mut w = line.split_whitespace();
         let el = w.next().ok_or_else(|| format!("line {} missing element", iline + 3))?.to_string();
         let x: f64 = w.next().ok_or_else(|| format!("line {} missing x", iline + 3))?.parse().map_err(|e| format!("line {} x parse: {e}", iline + 3))?;
         let y: f64 = w.next().ok_or_else(|| format!("line {} missing y", iline + 3))?.parse().map_err(|e| format!("line {} y parse: {e}", iline + 3))?;
         let z: f64 = w.next().ok_or_else(|| format!("line {} missing z", iline + 3))?.parse().map_err(|e| format!("line {} z parse: {e}", iline + 3))?;
+        let q: f64 = w.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
         elems.push(el);
         apos.push(Vec3d::new(x, y, z));
+        charges.push(q);
     }
 
     if apos.len() != natoms { return Err(format!("expected {} atoms, got {}", natoms, apos.len())); }
-    Ok(XyzSystem { apos, elems })
+    Ok(XyzSystem { apos, elems, charges })
 }
 
 pub fn write_xyz_frame(path: &Path, elems: &[String], apos: &[Vec3d], comment: &str, append: bool) -> Result<(), String> {

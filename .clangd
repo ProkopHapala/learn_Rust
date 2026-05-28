@@ -1,0 +1,8 @@
+# Project-level clangd configuration
+# Limits resource usage to prevent clangd from consuming all RAM
+
+CompileFlags:
+  Add:
+    - -j=2                           # Limit background indexing threads
+    - --background-index-priority=low
+    - --pch-storage=disk           # Keep precompiled headers on disk, not RAM

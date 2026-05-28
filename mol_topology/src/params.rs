@@ -635,142 +635,15 @@ fn hybridization(tname: &str) -> char {
 
 const KCAL_TO_EV: f64 = 4.1840 / 60.2214076 / 1.602176634; // 1 kcal/mol to eV
 
-/// Generic forcefield setup: assign types and compute all UFF parameters from atom types.
-/// Returns the assigned atom type names.
+// TODO: setup_forcefield depends on UFF and NonBondedFF which belong in mol_engine
+// This function should be moved to mol_engine or refactored to be forcefield-agnostic
+/*
 pub fn setup_forcefield(
     ff: &mut crate::uff::Uff,
     nb: &mut crate::nonbonded::NonBondedFF,
     params: &Params,
     elems: &[String],
 ) -> Vec<String> {
-    // 1. Assign atom types based on topology
-    let neighs: Vec<[i32; 4]> = ff.neighs.as_slice().iter().map(|q| q.as_array()).collect();
-    let atypes = assign_uff_types(elems, &neighs);
-
-    // 2. Set non-bonded REQ parameters
-    nb.make_second_neighs(ff.neighs.as_slice(), ff.natoms as usize);
-    for ia in 0..ff.natoms as usize {
-        nb.reqs.as_mut_slice()[ia] = get_reqh(params, &atypes[ia]);
-    }
-
-    // 3. Set bond parameters from UFF formulas
-    for ib in 0..ff.nbonds as usize {
-        let bnd = ff.bon_atoms.as_slice()[ib];
-        let ia = bnd[0] as usize;
-        let ja = bnd[1] as usize;
-        let ti = params.get_atom_type(&atypes[ia]).expect("unknown atom type");
-        let tj = params.get_atom_type(&atypes[ja]).expect("unknown atom type");
-        let ei = params.get_element_type(&ti.element).expect("unknown element");
-        let ej = params.get_element_type(&tj.element).expect("unknown element");
-        let bo = bond_order_from_types(&atypes[ia], &atypes[ja]);
-        let l0 = uff_bond_length(ti, tj, ei, ej, bo);
-        let k = uff_bond_k(ei, ej, l0);
-        ff.bon_params.as_mut_slice()[ib] = [k, l0];
-    }
-
-    // 4. Set angle parameters from UFF formulas
-    for ia in 0..ff.nangles as usize {
-        let ang = ff.ang_atoms.as_slice()[ia];
-        let i = ang[0] as usize;
-        let j = ang[1] as usize;
-        let k_ = ang[2] as usize;
-        let tj = params.get_atom_type(&atypes[j]).expect("unknown atom type");
-        let ti = params.get_atom_type(&atypes[i]).expect("unknown atom type");
-        let tk = params.get_atom_type(&atypes[k_]).expect("unknown atom type");
-        let ei = params.get_element_type(&ti.element).expect("unknown element");
-        let ek = params.get_element_type(&tk.element).expect("unknown element");
-
-        let ass = tj.a_ss.to_radians();
-        let ct = ass.cos();
-        let st2 = ass.sin() * ass.sin();
-
-        // need bond lengths rij and rjk for this angle
-        let b1 = (0..ff.nbonds as usize).find(|&ib| {
-            let bnd = ff.bon_atoms.as_slice()[ib];
-            (bnd[0] == i as i32 && bnd[1] == j as i32) || (bnd[0] == j as i32 && bnd[1] == i as i32)
-        }).expect("bond not found for angle");
-        let b2 = (0..ff.nbonds as usize).find(|&ib| {
-            let bnd = ff.bon_atoms.as_slice()[ib];
-            (bnd[0] == j as i32 && bnd[1] == k_ as i32) || (bnd[0] == k_ as i32 && bnd[1] == j as i32)
-        }).expect("bond not found for angle");
-        let rij = ff.bon_params.as_slice()[b1][1];
-        let rjk = ff.bon_params.as_slice()[b2][1];
-        let rik_sq = rij * rij + rjk * rjk - 2.0 * rij * rjk * ct;
-        let rik = rik_sq.sqrt();
-        let kappa = 28.7989689090648 * ei.q_uff * ek.q_uff / (rik_sq * rik_sq * rik)
-            * (3.0 * rij * rjk * st2 - rik_sq * ct);
-
-        let hyb = hybridization(&atypes[j]);
-        let (c0, c1, c2, c3) = match hyb {
-            '1' => uff_angle_sp1(),
-            '2' | 'R' => uff_angle_sp2(),
-            _ => uff_angle_sp3(ct, st2),
-        };
-        let kk = if hyb == '2' || hyb == 'R' { kappa / 9.0 } else { kappa };
-        ff.ang_params.as_mut_slice()[ia] = [kk, c0, c1, c2, c3];
-    }
-
-    // 5. Set dihedral parameters from UFF formulas
-    for id in 0..ff.ndihedrals as usize {
-        let d = ff.dih_atoms.as_slice()[id];
-        let i1 = d.x as usize;
-        let i2 = d.y as usize;
-        let i3 = d.z as usize;
-        let i4 = d.w as usize;
-        let t2 = &atypes[i2];
-        let t3 = &atypes[i3];
-        let at2 = params.get_atom_type(t2).expect("unknown atom type");
-        let at3 = params.get_atom_type(t3).expect("unknown atom type");
-        let e2 = params.get_element_type(&at2.element).expect("unknown element");
-        let e3 = params.get_element_type(&at3.element).expect("unknown element");
-        let h2 = hybridization(t2);
-        let h3 = hybridization(t3);
-
-        // count neighbors for central atoms
-        let n2 = neighs[i2].iter().take_while(|&&n| n >= 0).count() as i32;
-        let n3 = neighs[i3].iter().take_while(|&&n| n >= 0).count() as i32;
-        let denom = ((n2 - 1) * (n3 - 1)).max(1) as f64;
-
-        let (mut k, mut dd, mut nn) = (0.0, 1.0, 3.0);
-
-        if h2 == '1' || h3 == '1' {
-            // sp1 center: zero torsion
-            k = 0.0; dd = 1.0; nn = 1.0;
-        } else if h2 == '3' && h3 == '3' {
-            // sp3 - sp3
-            k = (e2.v_uff * e3.v_uff).sqrt();
-            dd = 1.0; nn = 3.0;
-            // special case O/S sp3 - O/S sp3
-            let e2name = &at2.element;
-            let e3name = &at3.element;
-            if (e2name == "O" || e2name == "S") && (e3name == "O" || e3name == "S") {
-                let mut k_ = KCAL_TO_EV;
-                nn = 2.0;
-                if e2name == "O" { k_ *= 2.0; } else { k_ *= 6.8; }
-                if e3name == "O" { k_ *= 2.0; } else { k_ *= 6.8; }
-                k = k_.sqrt();
-                dd = 1.0;
-            }
-        } else if (h2 == '3' && (h3 == '2' || h3 == 'R')) || ((h2 == '2' || h2 == 'R') && h3 == '3') {
-            // sp3 - sp2
-            k = KCAL_TO_EV;
-            dd = -1.0; nn = 6.0;
-            // special cases omitted for brevity; keep generic
-        } else if (h2 == '2' || h2 == 'R') && (h3 == '2' || h3 == 'R') {
-            // sp2 - sp2
-            let bo = bond_order_from_types(t2, t3);
-            k = 5.0 * (e2.u_uff * e3.u_uff).sqrt() * (1.0 + 4.18 * bo.ln());
-            dd = -1.0; nn = 2.0;
-        }
-
-        k = 0.5 * k / denom;
-        ff.dih_params.as_mut_slice()[id] = [k, dd, nn];
-    }
-
-    // 6. Inversions: disabled
-    for ii in 0..ff.ninversions as usize {
-        ff.inv_params.as_mut_slice()[ii] = [0.0, 1.0, -1.0, 0.0];
-    }
-
-    atypes
+    // ... implementation moved to mol_engine
 }
+*/

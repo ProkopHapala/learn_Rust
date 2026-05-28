@@ -7,6 +7,10 @@ members = [
     "examples/demo05_pointer_reinterpret",
     "examples/demo06_opencl_opengl_interop",
     "examples/demo07_uff_forcefield",
+    "examples/demo08_molecule_viewer",
+    "mol_utils",
+    "mol_topology",
+    "mol_engine",
 ]
 resolver = "2"
 

@@ -1,5 +1,5 @@
-use crate::math::quat4::Quat4i;
-use crate::math::vec3::Vec3d;
+use mol_utils::math::quat4::Quat4i;
+use mol_utils::math::vec3::Vec3d;
 
 pub struct Topology {
     pub apos: Vec<Vec3d>,

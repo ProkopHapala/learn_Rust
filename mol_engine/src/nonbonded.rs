@@ -1,6 +1,6 @@
-use crate::math::quat4::{Quat4i, QUAT4I_MINUS_ONES};
-use crate::math::vec3::{Vec3d, VEC3_ZERO};
-use crate::util::AlignedVec;
+use mol_utils::math::quat4::{Quat4i, QUAT4I_MINUS_ONES};
+use mol_utils::math::vec3::{Vec3d, VEC3_ZERO};
+use mol_utils::util::AlignedVec;
 
 const EXCL_MAX: usize = 16;
 const COULOMB_CONST: f64 = 14.3996448915; // eV*A / e^2

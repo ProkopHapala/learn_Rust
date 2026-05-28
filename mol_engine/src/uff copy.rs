@@ -1,7 +1,8 @@
-use crate::math::quat4::{Quat4d, Quat4i, QUAT4I_MINUS_ONES};
-use crate::math::vec3::{Vec3d, VEC3_NAN, VEC3_ZERO};
-use crate::topology::Topology;
-use crate::util::AlignedVec;
+use mol_utils::math::quat4::{Quat4d, Quat4i, QUAT4I_MINUS_ONES};
+use mol_utils::math::vec3::{Vec3d, VEC3_NAN, VEC3_ZERO};
+use mol_utils::util::AlignedVec;
+use mol_topology::topology::Topology;
+use crate::surface::SurfaceFolded;
 
 #[derive(Default)]
 pub struct Buckets {
@@ -87,6 +88,10 @@ pub struct Uff {
     pub dih_params: AlignedVec<[f64; 3], 64>, // [V, d_sign, n] per dihedral
     pub inv_params: AlignedVec<[f64; 4], 64>, // [K, C0, C1, C2] per inversion
     pub reqs: AlignedVec<[f64; 4], 64>,      // [RvdW, sqrt(EvdW), Q, Hb] per atom
+
+    // --- Surface interaction
+    pub surface: Option<SurfaceFolded>,
+    pub surface_atom_types: Vec<usize>,
 
     // --- Control constants
     pub rdamp: f64,
@@ -202,6 +207,8 @@ impl Uff {
             dih_params,
             inv_params,
             reqs,
+            surface: None,
+            surface_atom_types: vec![0; natoms as usize],
             rdamp: 0.1,
             sub_nb_torsion_factor: 0.0,
         }
@@ -520,7 +527,7 @@ impl Uff {
 
     #[inline(always)]
     pub fn eval_atom_bonds(&mut self, ia: usize) -> f64 {
-        use crate::math::vec2::Vec2d;
+        use mol_utils::math::vec2::Vec2d;
         let apos = self.apos.as_slice();
         let fapos = self.fapos.as_mut_slice();
         let hneigh = self.hneigh.as_mut_slice();
@@ -556,7 +563,7 @@ impl Uff {
 
     #[inline(always)]
     pub fn eval_angle_prokop(&mut self, ia: usize) -> f64 {
-        use crate::math::vec2::Vec2d;
+        use mol_utils::math::vec2::Vec2d;
         let ngs = self.ang_ngs.as_slice()[ia];
         if ngs[0] < 0 || ngs[1] < 0 { return 0.0; }
         let qij = self.hneigh.as_slice()[ngs[0] as usize]; // ji
@@ -595,7 +602,7 @@ impl Uff {
 
     #[inline(always)]
     pub fn eval_dihedral_prokop(&mut self, id: usize) -> f64 {
-        use crate::math::vec2::Vec2d;
+        use mol_utils::math::vec2::Vec2d;
         let ngs = self.dih_ngs.as_slice()[id];
         if ngs[0] < 0 || ngs[1] < 0 || ngs[2] < 0 { return 0.0; }
         let q12 = self.hneigh.as_slice()[ngs[0] as usize]; // ji
@@ -633,7 +640,7 @@ impl Uff {
 
     #[inline(always)]
     pub fn eval_inversion_prokop(&mut self, ii: usize) -> f64 {
-        use crate::math::vec2::Vec2d;
+        use mol_utils::math::vec2::Vec2d;
         let ngs = self.inv_ngs.as_slice()[ii];
         if ngs[0] < 0 || ngs[1] < 0 || ngs[2] < 0 { return 0.0; }
         let q21 = self.hneigh.as_slice()[ngs[0] as usize]; // ji
@@ -695,11 +702,12 @@ impl Uff {
 
     // ======================== HIGH-LEVEL MD LOOP ========================
 
-    pub fn eval_forces(&mut self) -> (f64, f64, f64, f64) {
+    pub fn eval_forces(&mut self) -> (f64, f64, f64, f64, f64) {
         let mut eb = 0.0;
         let mut ea = 0.0;
         let mut ed = 0.0;
         let mut ei = 0.0;
+        let mut es = 0.0;
         // Zero fapos
         for f in self.fapos.as_mut_slice() { *f = VEC3_ZERO; }
         // Bonds (also updates hneigh)
@@ -720,7 +728,19 @@ impl Uff {
         for ia in 0..self.natoms {
             self.assemble_atom_force(ia);
         }
-        (eb, ea, ed, ei)
+        // Surface interaction
+        if let Some(ref surf) = self.surface {
+            let apos = self.apos.as_slice();
+            let fapos = self.fapos.as_mut_slice();
+            let reqs = self.reqs.as_slice();
+            for ia in 0..self.natoms as usize {
+                let ityp = self.surface_atom_types[ia];
+                let (e, f) = surf.eval_atom(apos[ia], ityp, reqs[ia]);
+                es += e;
+                fapos[ia].add(f);
+            }
+        }
+        (eb, ea, ed, ei, es)
     }
 
     /// Set minimal demo parameters based on current geometry.
@@ -750,6 +770,15 @@ impl Uff {
         }
     }
 
+    /// Attach a NaCl-like substrate surface.
+    /// a: lattice constant (Å), z0: surface plane z-coordinate,
+    /// beta_vdw: decay rate (1/Å), q_amp: electrostatic amplitude (eV),
+    /// plq_amp: Pauli/London amplitude (eV)
+    pub fn setup_nacl_surface(&mut self, a: f64, z0: f64, beta_vdw: f64, q_amp: f64, plq_amp: f64) {
+        self.surface = Some(crate::surface::setup_nacl_surface(a, z0, beta_vdw, q_amp, plq_amp));
+        self.surface_atom_types.resize(self.natoms as usize, 0);
+    }
+
     pub fn run_md(&mut self, niter: i32, dt: f64, fconv: f64, flim: f64, damping: f64) -> i32 {
         let f2conv = fconv * fconv;
         let cdamp = {
@@ -757,8 +786,8 @@ impl Uff {
             if c < 0.0 { 0.0 } else { c }
         };
         for itr in 0..niter {
-            let (eb, ea, ed, ei) = self.eval_forces();
-            let _etot = eb + ea + ed + ei;
+            let (eb, ea, ed, ei, es) = self.eval_forces();
+            let _etot = eb + ea + ed + ei + es;
             let mut ff = 0.0;
             let mut vv = 0.0;
             let mut vf = 0.0;
