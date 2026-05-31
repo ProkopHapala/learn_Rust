@@ -1,0 +1,10 @@
+[package]
+name = "demo09_collision_debug"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macroquad = "0.4"
+mol_engine = { path = "../../mol_engine" }
+mol_utils = { path = "../../mol_utils" }
+mol_topology = { path = "../../mol_topology" }

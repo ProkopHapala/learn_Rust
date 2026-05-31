@@ -8,6 +8,7 @@ members = [
     "examples/demo06_opencl_opengl_interop",
     "examples/demo07_uff_forcefield",
     "examples/demo08_molecule_viewer",
+    "examples/demo09_collision_debug",
     "mol_utils",
     "mol_topology",
     "mol_engine",

@@ -3,12 +3,18 @@ use mol_topology::topology::Topology;
 use crate::uff::Uff;
 use crate::nonbonded::NonBondedFF;
 use crate::surface::SurfaceFolded;
+use crate::rigid_sp3::RigidSp3FF;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BondedFFMode { Uff, RigidSp3 }
 
 /// MolWorld orchestrates multiple forcefield engines for molecular dynamics.
 /// Shared state (apos, fapos, vapos, reqs) lives in the Uff engine for efficiency.
 /// Optional engines (nonbonded, surface) are evaluated after bonded forces.
 pub struct MolWorld {
     pub uff: Uff,
+    pub rigid_sp3: RigidSp3FF,
+    pub bonded_mode: BondedFFMode,
     pub nonbonded: Option<NonBondedFF>,
     pub surface: Option<SurfaceFolded>,
     pub surface_atom_types: Vec<usize>,
@@ -22,8 +28,11 @@ impl MolWorld {
 
     pub fn from_uff(uff: Uff) -> Self {
         let natoms = uff.natoms as usize;
+        let rigid_sp3 = RigidSp3FF::from_uff(&uff);
         Self {
             uff,
+            rigid_sp3,
+            bonded_mode: BondedFFMode::RigidSp3,
             nonbonded: None,
             surface: None,
             surface_atom_types: vec![0; natoms],
@@ -35,8 +44,10 @@ impl MolWorld {
     /// Evaluate all forces, accumulating into uff.fapos.
     /// Returns: (eb, ea, ed, ei, enb, es) = (bond, angle, dihedral, inversion, nonbonded, surface)
     pub fn eval_forces(&mut self) -> (f64, f64, f64, f64, f64, f64) {
-        // Bonded forces (zeros fapos, computes bonds/angles/dihedrals/inversions)
-        let (eb, ea, ed, ei) = self.uff.eval_forces();
+        let (eb, ea, ed, ei) = match self.bonded_mode {
+            BondedFFMode::Uff => self.uff.eval_forces(),
+            BondedFFMode::RigidSp3 => (self.rigid_sp3.eval_forces(&mut self.uff), 0.0, 0.0, 0.0),
+        };
         let mut enb = 0.0;
         let mut es = 0.0;
 
@@ -71,24 +82,10 @@ impl MolWorld {
     /// Single atom MD step. Returns (v·f, v·v, f·f) for convergence/instability checks.
     #[inline(always)]
     pub fn move_atom_md(&mut self, i: usize, dt: f64, flim: f64, cdamp: f64) -> (f64, f64, f64) {
-        let f = self.uff.fapos.as_slice()[i];
-        let v = self.uff.vapos.as_slice()[i];
-        let p = self.uff.apos.as_slice()[i];
-        let ff = v.dot(f);
-        let vv = v.norm2();
-        let f2 = f.norm2();
-        let mut f_clamped = f;
-        if f2 > flim * flim {
-            f_clamped.mul(flim / f2.sqrt());
+        match self.bonded_mode {
+            BondedFFMode::Uff => self.uff.move_atom_md(i, dt, flim, cdamp),
+            BondedFFMode::RigidSp3 => self.rigid_sp3.move_atom_md(&mut self.uff, i, dt, flim, cdamp),
         }
-        let mut v_new = v;
-        v_new.mul(cdamp);
-        v_new.add_mul(f_clamped, dt);
-        let mut p_new = p;
-        p_new.add_mul(v_new, dt);
-        self.uff.apos.as_mut_slice()[i] = p_new;
-        self.uff.vapos.as_mut_slice()[i] = v_new;
-        (ff, vv, f2)
     }
 
     pub fn clean_velocity(&mut self) {

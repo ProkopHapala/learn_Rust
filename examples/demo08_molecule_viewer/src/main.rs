@@ -1,6 +1,7 @@
 use macroquad::prelude::*;
 use macroquad::models::{Mesh, Vertex, draw_mesh};
 use mol_engine::mol_world::MolWorld;
+use mol_engine::mol_world::BondedFFMode;
 use mol_utils::math::vec3::Vec3d;
 use mol_utils::xyz;
 use mol_topology::builder;
@@ -400,6 +401,13 @@ impl App {
         if is_key_pressed(KeyCode::H) {
             self.show_help = !self.show_help;
         }
+        if is_key_pressed(KeyCode::F) {
+            self.world.bonded_mode = match self.world.bonded_mode {
+                BondedFFMode::Uff => BondedFFMode::RigidSp3,
+                BondedFFMode::RigidSp3 => BondedFFMode::Uff,
+            };
+            println!("bonded_mode = {:?}", self.world.bonded_mode);
+        }
         // Toggle surface
         if is_key_pressed(KeyCode::S) {
             self.show_surface = !self.show_surface;
@@ -763,22 +771,27 @@ async fn main() {
     let sys = xyz::read_xyz(&xyz_path).expect("read_xyz failed");
     println!("Loaded {} atoms", sys.elems.len());
 
-    // Load real forcefield parameters
     let dat_dir = workspace_root.join("tmp/FireCore_cpp/common_resources");
     let mut params = Params::new();
-    params.load_element_types(dat_dir.join("ElementTypes.dat"));
-    params.load_atom_types(dat_dir.join("AtomTypes.dat"));
-    params.load_bond_types(dat_dir.join("BondTypes.dat"));
-    params.load_angle_types(dat_dir.join("AngleTypes.dat"));
-    println!("Loaded {} elements, {} atom types, {} bond types",
-        params.elements.len(), params.atom_types.len(), params.bonds.len());
+    let have_params = dat_dir.join("ElementTypes.dat").exists() && dat_dir.join("AtomTypes.dat").exists() && dat_dir.join("BondTypes.dat").exists() && dat_dir.join("AngleTypes.dat").exists();
+    if have_params {
+        params.load_element_types(dat_dir.join("ElementTypes.dat"));
+        params.load_atom_types(dat_dir.join("AtomTypes.dat"));
+        params.load_bond_types(dat_dir.join("BondTypes.dat"));
+        params.load_angle_types(dat_dir.join("AngleTypes.dat"));
+        println!("Loaded {} elements, {} atom types, {} bond types",
+            params.elements.len(), params.atom_types.len(), params.bonds.len());
+    } else {
+        println!("WARNING: FireCore_cpp/common_resources .dat files not found in {:?}; running with dummy radii/REQs/bond params", dat_dir);
+    }
 
-    // Build topology with chemistry-aware bond detection (covalent radii + tol)
-    let radii: Vec<f64> = sys.elems.iter().map(|el| {
-        params.get_element_type(el)
-            .map(|et| et.r_cov)
-            .unwrap_or(1.0) // fallback if element not in params
-    }).collect();
+    let radii: Vec<f64> = if have_params {
+        sys.elems.iter().map(|el| {
+            params.get_element_type(el).map(|et| et.r_cov).unwrap_or(1.0)
+        }).collect()
+    } else {
+        sys.elems.iter().map(|el| match el.as_str() { "H" => 0.31, "C" => 0.76, "N" => 0.71, "O" => 0.66, _ => 1.0 }).collect()
+    };
     let mut b = builder::Builder::from_positions_and_radii(&sys.apos, &radii, 0.4);
     let top = b.bake();
     let mut world = MolWorld::from_topology(&top);
@@ -789,59 +802,71 @@ async fn main() {
     world.bake_inversion_neighs();
     world.map_atom_interactions();
 
-    // === Assign forcefield parameters from loaded Params (no dummy params) ===
     {
-        let neighs: Vec<[i32; 4]> = world.uff.neighs.as_slice().iter().map(|q| q.as_array()).collect();
-        let uff_types = assign_uff::assign_uff_types(&sys.elems, &neighs);
+        if have_params {
+            let neighs: Vec<[i32; 4]> = world.uff.neighs.as_slice().iter().map(|q| q.as_array()).collect();
+            let uff_types = assign_uff::assign_uff_types(&sys.elems, &neighs);
 
-        // Atom REQs (RvdW, sqrt(EvdW), Q, Hb) from Params based on UFF type; XYZ 5th column overrides Q if present
-        for i in 0..world.natoms() {
-            let t = uff_types[i].as_str();
-            let mut req = get_reqh(&params, t);
-            if sys.charges[i] != 0.0 { req[2] = sys.charges[i]; }
-            world.uff.reqs.as_mut_slice()[i] = req;
-        }
-
-        println!("=== Atom types + charges ===");
-        for i in 0..world.natoms() {
-            let q = world.uff.reqs.as_slice()[i][2];
-            println!("atom {:3} el {:2} type {:6} Q {:8.4}", i, sys.elems[i], uff_types[i], q);
-        }
-
-        // Bonds: use element symbols + order=1 to look up BondTypes.dat
-        for ib in 0..world.uff.nbonds as usize {
-            let b = world.uff.bon_atoms.as_slice()[ib];
-            let ia = b[0] as usize;
-            let ja = b[1] as usize;
-            let a = sys.elems[ia].as_str();
-            let b = sys.elems[ja].as_str();
-            if let Some(bp) = params.get_bond_param(a, b, 1) {
-                world.uff.bon_params.as_mut_slice()[ib] = [bp.k, bp.l0];
-            } else {
-                panic!("missing bond param for {}-{} order=1", a, b);
+            for i in 0..world.natoms() {
+                let t = uff_types[i].as_str();
+                let mut req = get_reqh(&params, t);
+                if sys.charges[i] != 0.0 { req[2] = sys.charges[i]; }
+                world.uff.reqs.as_mut_slice()[i] = req;
             }
-        }
 
-        // Angles: use element symbols + AngleTypes.dat (supports wildcards)
-        // Convert (theta0,k) into UFF Fourier coefficients used by eval_angle_prokop
-        for ia in 0..world.uff.nangles as usize {
-            let ang = world.uff.ang_atoms.as_slice()[ia];
-            let i0 = ang[0] as usize;
-            let i1 = ang[1] as usize;
-            let i2 = ang[2] as usize;
-            let a = sys.elems[i0].as_str();
-            let b = sys.elems[i1].as_str();
-            let c = sys.elems[i2].as_str();
-            let ap = params.get_angle_param(a, b, c).unwrap_or_else(|| panic!("missing angle param for {}-{}-{}", a, b, c));
+            println!("=== Atom types + charges ===");
+            for i in 0..world.natoms() {
+                let q = world.uff.reqs.as_slice()[i][2];
+                println!("atom {:3} el {:2} type {:6} Q {:8.4}", i, sys.elems[i], uff_types[i], q);
+            }
 
-            let th0 = ap.a0.to_radians();
-            let ct = th0.cos();
-            let st2 = 1.0 - ct * ct;
-            assert!(st2 > 1e-12, "invalid angle theta0={} deg leads to sin^2(theta0)~0", ap.a0);
-            let c2 = 1.0 / (4.0 * st2);
-            let c1 = -4.0 * c2 * ct;
-            let c0 = c2 * (2.0 * ct * ct + 1.0);
-            world.uff.ang_params.as_mut_slice()[ia] = [ap.k, c0, c1, c2, 0.0];
+            for ib in 0..world.uff.nbonds as usize {
+                let b = world.uff.bon_atoms.as_slice()[ib];
+                let ia = b[0] as usize;
+                let ja = b[1] as usize;
+                let a = sys.elems[ia].as_str();
+                let b = sys.elems[ja].as_str();
+                if let Some(bp) = params.get_bond_param(a, b, 1) {
+                    world.uff.bon_params.as_mut_slice()[ib] = [bp.k, bp.l0];
+                } else {
+                    panic!("missing bond param for {}-{} order=1", a, b);
+                }
+            }
+
+            for ia in 0..world.uff.nangles as usize {
+                let ang = world.uff.ang_atoms.as_slice()[ia];
+                let i0 = ang[0] as usize;
+                let i1 = ang[1] as usize;
+                let i2 = ang[2] as usize;
+                let a = sys.elems[i0].as_str();
+                let b = sys.elems[i1].as_str();
+                let c = sys.elems[i2].as_str();
+                let ap = params.get_angle_param(a, b, c).unwrap_or_else(|| panic!("missing angle param for {}-{}-{}", a, b, c));
+
+                let th0 = ap.a0.to_radians();
+                let ct = th0.cos();
+                let st2 = 1.0 - ct * ct;
+                assert!(st2 > 1e-12, "invalid angle theta0={} deg leads to sin^2(theta0)~0", ap.a0);
+                let c2 = 1.0 / (4.0 * st2);
+                let c1 = -4.0 * c2 * ct;
+                let c0 = c2 * (2.0 * ct * ct + 1.0);
+                world.uff.ang_params.as_mut_slice()[ia] = [ap.k, c0, c1, c2, 0.0];
+            }
+        } else {
+            for i in 0..world.natoms() {
+                let mut req = [1.5, 0.1, 0.0, 0.0];
+                if sys.charges[i] != 0.0 { req[2] = sys.charges[i]; }
+                world.uff.reqs.as_mut_slice()[i] = req;
+            }
+            let apos = world.uff.apos.as_slice();
+            for ib in 0..world.uff.nbonds as usize {
+                let b = world.uff.bon_atoms.as_slice()[ib];
+                let ia = b[0] as usize;
+                let ja = b[1] as usize;
+                let d = mol_utils::math::vec3::Vec3d::set_sub(apos[ja], apos[ia]);
+                let l0 = d.norm();
+                world.uff.bon_params.as_mut_slice()[ib] = [100.0, l0];
+            }
         }
     }
 
