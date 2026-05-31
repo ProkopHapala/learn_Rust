@@ -2,11 +2,13 @@ use macroquad::prelude::*;
 use macroquad::models::{Mesh, Vertex, draw_mesh};
 use mol_engine::mol_world::MolWorld;
 use mol_engine::mol_world::BondedFFMode;
+use mol_engine::nonbonded::NonBondedFF;
 use mol_utils::math::vec3::Vec3d;
 use mol_utils::xyz;
 use mol_topology::builder;
 use mol_topology::assign_uff;
 use mol_topology::params::{Params, get_reqh};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ------------------------------------------------------------------
@@ -24,6 +26,8 @@ const LATTICE_A: f64 = 3.5;           // NaCl lattice constant
 const BETA_VDW: f64 = 0.5;            // vdW decay
 const Q_AMP: f64 = 1.0;               // electrostatic amplitude
 const PLQ_AMP: f64 = 1.0;             // Pauli/London amplitude
+
+const GROUP_SIZE_DEFAULT: usize = 32;
 
 // ------------------------------------------------------------------
 // Element color / radius lookup from loaded Params
@@ -47,6 +51,83 @@ fn u32_to_color(c: u32) -> Color {
         (c & 0xFF) as u8,
         255,
     )
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Aabb { min: Vec3, max: Vec3 }
+
+fn draw_aabb(b: Aabb, col: Color) {
+    let mn = b.min;
+    let mx = b.max;
+    let p000 = vec3(mn.x, mn.y, mn.z);
+    let p001 = vec3(mn.x, mn.y, mx.z);
+    let p010 = vec3(mn.x, mx.y, mn.z);
+    let p011 = vec3(mn.x, mx.y, mx.z);
+    let p100 = vec3(mx.x, mn.y, mn.z);
+    let p101 = vec3(mx.x, mn.y, mx.z);
+    let p110 = vec3(mx.x, mx.y, mn.z);
+    let p111 = vec3(mx.x, mx.y, mx.z);
+    draw_line_3d(p000, p001, col); draw_line_3d(p000, p010, col); draw_line_3d(p000, p100, col);
+    draw_line_3d(p111, p110, col); draw_line_3d(p111, p101, col); draw_line_3d(p111, p011, col);
+    draw_line_3d(p001, p011, col); draw_line_3d(p001, p101, col);
+    draw_line_3d(p010, p011, col); draw_line_3d(p010, p110, col);
+    draw_line_3d(p100, p101, col); draw_line_3d(p100, p110, col);
+}
+
+#[inline(always)]
+fn color_group(g: usize) -> Color {
+    let t = (g as f32 * 0.271828).fract();
+    Color::new(0.2 + 0.7 * t, 0.2 + 0.7 * (1.0 - t), 0.5 + 0.4 * (t - 0.5).abs(), 1.0)
+}
+
+#[inline(always)]
+fn morton3_10(x: u32, y: u32, z: u32) -> u32 {
+    #[inline(always)]
+    fn part1by2(mut v: u32) -> u32 {
+        v &= 0x000003ff;
+        v = (v | (v << 16)) & 0x30000ff;
+        v = (v | (v << 8)) & 0x300f00f;
+        v = (v | (v << 4)) & 0x30c30c3;
+        v = (v | (v << 2)) & 0x9249249;
+        v
+    }
+    (part1by2(x) << 0) | (part1by2(y) << 1) | (part1by2(z) << 2)
+}
+
+fn compute_groups_morton(pos: &[Vec3], group_size: usize) -> (Vec<usize>, Vec<Aabb>) {
+    let n = pos.len();
+    if n == 0 { return (Vec::new(), Vec::new()); }
+    let mut mn = pos[0];
+    let mut mx = pos[0];
+    for &p in pos.iter() {
+        mn.x = mn.x.min(p.x); mn.y = mn.y.min(p.y); mn.z = mn.z.min(p.z);
+        mx.x = mx.x.max(p.x); mx.y = mx.y.max(p.y); mx.z = mx.z.max(p.z);
+    }
+    let span = (mx - mn).max(vec3(1e-6, 1e-6, 1e-6));
+    let mut keys: Vec<(u32, usize)> = (0..n).map(|i| {
+        let p = (pos[i] - mn) / span;
+        let xi = (p.x.clamp(0.0, 1.0) * 1023.0) as u32;
+        let yi = (p.y.clamp(0.0, 1.0) * 1023.0) as u32;
+        let zi = (p.z.clamp(0.0, 1.0) * 1023.0) as u32;
+        (morton3_10(xi, yi, zi), i)
+    }).collect();
+    keys.sort_unstable_by_key(|p| p.0);
+    let order: Vec<usize> = keys.into_iter().map(|p| p.1).collect();
+    let ng = (n + group_size - 1) / group_size;
+    let mut bbs = vec![Aabb { min: vec3(1e10, 1e10, 1e10), max: vec3(-1e10, -1e10, -1e10) }; ng];
+    for g in 0..ng {
+        let i0 = g * group_size;
+        let i1 = ((g + 1) * group_size).min(n);
+        let mut b = bbs[g];
+        for ii in i0..i1 {
+            let i = order[ii];
+            let p = pos[i];
+            b.min.x = b.min.x.min(p.x); b.min.y = b.min.y.min(p.y); b.min.z = b.min.z.min(p.z);
+            b.max.x = b.max.x.max(p.x); b.max.y = b.max.y.max(p.y); b.max.z = b.max.z.max(p.z);
+        }
+        bbs[g] = b;
+    }
+    (order, bbs)
 }
 
 // ------------------------------------------------------------------
@@ -221,6 +302,12 @@ struct App {
     show_bonds: bool,
     show_surface: bool,
     show_help: bool,
+    show_groups: bool,
+    show_ports: bool,
+
+    group_size: usize,
+    group_order: Vec<usize>,
+    group_bboxes: Vec<Aabb>,
 
     // physics
     run_relax: bool,
@@ -242,7 +329,7 @@ struct App {
 }
 
 impl App {
-    fn new(world: MolWorld, elems: Vec<String>, params: Params) -> Self {
+    fn new(world: MolWorld, elems: Vec<String>, params: Params, group_size: usize) -> Self {
         let natoms = world.natoms();
         let mut app = Self {
             world,
@@ -261,6 +348,11 @@ impl App {
             show_bonds: true,
             show_surface: true,
             show_help: true,
+            show_groups: false,
+            show_ports: false,
+            group_size,
+            group_order: Vec::new(),
+            group_bboxes: Vec::new(),
             run_relax: false,
             dt: 0.02,
             flim: 1000.0,
@@ -276,8 +368,19 @@ impl App {
         app.rebuild_bond_cache();
         app.rebuild_surface_cache();
         app.sync_pos_from_engine();
+        app.rebuild_groups();
         app.eval_energies();
         app
+    }
+
+    fn rebuild_groups(&mut self) {
+        let (ord, mut bbs) = compute_groups_morton(&self.apos, self.group_size);
+        for b in bbs.iter_mut() {
+            b.min -= vec3(0.5, 0.5, 0.5);
+            b.max += vec3(0.5, 0.5, 0.5);
+        }
+        self.group_order = ord;
+        self.group_bboxes = bbs;
     }
 
     fn rebuild_bond_cache(&mut self) {
@@ -401,6 +504,9 @@ impl App {
         if is_key_pressed(KeyCode::H) {
             self.show_help = !self.show_help;
         }
+        if is_key_pressed(KeyCode::T) {
+            self.show_ports = !self.show_ports;
+        }
         if is_key_pressed(KeyCode::F) {
             self.world.bonded_mode = match self.world.bonded_mode {
                 BondedFFMode::Uff => BondedFFMode::RigidSp3,
@@ -411,6 +517,9 @@ impl App {
         // Toggle surface
         if is_key_pressed(KeyCode::S) {
             self.show_surface = !self.show_surface;
+        }
+        if is_key_pressed(KeyCode::G) {
+            self.show_groups = !self.show_groups;
         }
         // Toggle bonds
         if is_key_pressed(KeyCode::B) {
@@ -549,7 +658,7 @@ impl App {
         // --- Atoms ---
         for i in 0..self.world.natoms() {
             let pos = self.apos[i];
-            let r = element_radius(&self.elems[i], &self.params) * ATOM_SCALE;
+            let r = if self.show_ports { 0.03 } else { element_radius(&self.elems[i], &self.params) * ATOM_SCALE };
             let col = element_color(&self.elems[i], &self.params);
 
             // Highlight selected atom with a bright, larger shell
@@ -572,6 +681,32 @@ impl App {
             }
 
             draw_sphere(pos, r, None, col);
+        }
+
+        if self.show_ports {
+            let uff = &self.world.uff;
+            let rr = &self.world.rigid_sp3;
+            for i in 0..self.world.natoms() {
+                let xi = uff.apos.as_slice()[i];
+                let pi = vec3(xi.x as f32, xi.y as f32, xi.z as f32);
+                let bs = uff.neigh_bs.as_slice()[i].as_array();
+                let np = rr.nport[i] as usize;
+                for s in 0..np {
+                    let ib = bs[s];
+                    if ib < 0 { continue; }
+                    let l0 = uff.bon_params.as_slice()[ib as usize][1];
+                    let tip = rr.get_port_tip(uff, i, s, l0);
+                    let pt = vec3(tip.x as f32, tip.y as f32, tip.z as f32);
+                    draw_line_3d(pi, pt, ORANGE);
+                    draw_sphere(pt, 0.05, None, Color::new(1.0, 0.4, 0.0, 0.9));
+                }
+            }
+        }
+
+        if self.show_groups {
+            for (g, b) in self.group_bboxes.iter().enumerate() {
+                draw_aabb(*b, color_group(g));
+            }
         }
 
         // --- Draw line from picked atom to mouse cursor (like MolGUI) ---
@@ -689,6 +824,8 @@ impl App {
                 "H                  -> toggle help",
                 "ESC                -> unpick",
                 "C                  -> reset camera",
+                "G                  -> toggle group AABBs",
+                "T                  -> toggle port visualization",
             ];
             for (i, line) in help.iter().enumerate() {
                 draw_text(line, hx + 10.0, hy + 20.0 + i as f32 * 16.0, 14.0, GRAY);
@@ -757,21 +894,50 @@ async fn main() {
         })
         .unwrap_or_else(|_| std::env::current_dir().unwrap());
 
-    // Parse args: first arg is xyz file path (resolve relative to workspace root)
-    let xyz_path: PathBuf = std::env::args().nth(1)
-        .map(|s| {
-            let p = PathBuf::from(s);
-            if p.is_absolute() { p } else { workspace_root.join(p) }
-        })
-        .unwrap_or_else(|| {
-            workspace_root.join("examples/demo07_uff_forcefield/water.xyz")
-        });
+    let args: Vec<String> = std::env::args().collect();
+    let mut copies_x: usize = 1;
+    let mut copies_y: usize = 1;
+    let mut spacing: f64 = 12.0;
+    let mut group_size: usize = GROUP_SIZE_DEFAULT;
+    {
+        let mut it = args.iter().skip(1);
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--copies-x" => { copies_x = it.next().unwrap_or(&"1".to_string()).parse().unwrap_or(1); }
+                "--copies-y" => { copies_y = it.next().unwrap_or(&"1".to_string()).parse().unwrap_or(1); }
+                "--spacing" => { spacing = it.next().unwrap_or(&"12.0".to_string()).parse().unwrap_or(12.0); }
+                "--group-size" => { group_size = it.next().unwrap_or(&"32".to_string()).parse().unwrap_or(GROUP_SIZE_DEFAULT); }
+                _ => {}
+            }
+        }
+    }
+    let xyz_path: PathBuf = args.iter().skip(1).find(|s| !s.starts_with("--")).map(|s| {
+        let p = PathBuf::from(s);
+        if p.is_absolute() { p } else { workspace_root.join(p) }
+    }).unwrap_or_else(|| workspace_root.join("examples/demo07_uff_forcefield/water.xyz"));
 
     println!("Loading XYZ: {:?}", xyz_path);
     let sys = xyz::read_xyz(&xyz_path).expect("read_xyz failed");
     println!("Loaded {} atoms", sys.elems.len());
 
-    let dat_dir = workspace_root.join("tmp/FireCore_cpp/common_resources");
+    let mut apos = Vec::<Vec3d>::new();
+    let mut elems = Vec::<String>::new();
+    let mut charges = Vec::<f64>::new();
+    for iy in 0..copies_y {
+        for ix in 0..copies_x {
+            let shift = Vec3d::new((ix as f64) * spacing, (iy as f64) * spacing, 0.0);
+            let i0 = apos.len();
+            apos.extend(sys.apos.iter().map(|p| Vec3d::set_add(*p, shift)));
+            elems.extend(sys.elems.iter().cloned());
+            charges.extend(sys.charges.iter().copied());
+            let i1 = apos.len();
+            assert!(i1 - i0 == sys.apos.len());
+        }
+    }
+    println!("Spawned copies: {}x{} -> natoms={}", copies_x, copies_y, apos.len());
+
+    let dat_dir_candidates = [workspace_root.join("tmp/FireCore_cpp/common_resources"), workspace_root.join("data")];
+    let dat_dir = dat_dir_candidates.iter().find(|d| d.join("ElementTypes.dat").exists() && d.join("AtomTypes.dat").exists() && d.join("BondTypes.dat").exists() && d.join("AngleTypes.dat").exists()).cloned().unwrap_or_else(|| dat_dir_candidates[0].clone());
     let mut params = Params::new();
     let have_params = dat_dir.join("ElementTypes.dat").exists() && dat_dir.join("AtomTypes.dat").exists() && dat_dir.join("BondTypes.dat").exists() && dat_dir.join("AngleTypes.dat").exists();
     if have_params {
@@ -779,20 +945,21 @@ async fn main() {
         params.load_atom_types(dat_dir.join("AtomTypes.dat"));
         params.load_bond_types(dat_dir.join("BondTypes.dat"));
         params.load_angle_types(dat_dir.join("AngleTypes.dat"));
+        if dat_dir.join("DihedralTypes.dat").exists() { params.load_dihedral_types(dat_dir.join("DihedralTypes.dat")); }
         println!("Loaded {} elements, {} atom types, {} bond types",
             params.elements.len(), params.atom_types.len(), params.bonds.len());
     } else {
-        println!("WARNING: FireCore_cpp/common_resources .dat files not found in {:?}; running with dummy radii/REQs/bond params", dat_dir);
+        println!("WARNING: .dat files not found in {:?}; running with dummy radii/REQs/bond params", dat_dir);
     }
 
     let radii: Vec<f64> = if have_params {
-        sys.elems.iter().map(|el| {
+        elems.iter().map(|el| {
             params.get_element_type(el).map(|et| et.r_cov).unwrap_or(1.0)
         }).collect()
     } else {
-        sys.elems.iter().map(|el| match el.as_str() { "H" => 0.31, "C" => 0.76, "N" => 0.71, "O" => 0.66, _ => 1.0 }).collect()
+        elems.iter().map(|el| match el.as_str() { "H" => 0.31, "C" => 0.76, "N" => 0.71, "O" => 0.66, _ => 1.0 }).collect()
     };
-    let mut b = builder::Builder::from_positions_and_radii(&sys.apos, &radii, 0.4);
+    let mut b = builder::Builder::from_positions_and_radii(&apos, &radii, 0.4);
     let top = b.bake();
     let mut world = MolWorld::from_topology(&top);
 
@@ -802,30 +969,51 @@ async fn main() {
     world.bake_inversion_neighs();
     world.map_atom_interactions();
 
+    world.nonbonded = Some(NonBondedFF::new(world.natoms()));
+    let natoms = world.natoms();
+    let neighs = world.uff.neighs.as_slice().to_vec();
+    world.nonbonded.as_mut().unwrap().make_second_neighs(&neighs, natoms);
+    world.nonbonded.as_mut().unwrap().set_cutoff(8.0);
+
     {
         if have_params {
             let neighs: Vec<[i32; 4]> = world.uff.neighs.as_slice().iter().map(|q| q.as_array()).collect();
-            let uff_types = assign_uff::assign_uff_types(&sys.elems, &neighs);
+            let uff_types = assign_uff::assign_uff_types(&elems, &neighs);
+
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for t in &uff_types { *counts.entry(t.clone()).or_insert(0) += 1; }
+            let mut kv: Vec<(String, usize)> = counts.into_iter().collect();
+            kv.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            println!("=== UFF type histogram ===");
+            for (t, c) in kv.iter() { println!("{:6}  {}", t, c); }
+
+            let has_sp2 = uff_types.iter().any(|t| matches!(t.as_str(), "C_R"|"C_2"|"N_R"|"O_2"|"O_R"));
+            if has_sp2 {
+                world.bonded_mode = BondedFFMode::Uff;
+                println!("Detected sp2/aromatic types -> default bonded_mode = Uff");
+            }
+
+            world.rigid_sp3.set_port_geometry_from_types(&uff_types);
 
             for i in 0..world.natoms() {
                 let t = uff_types[i].as_str();
                 let mut req = get_reqh(&params, t);
-                if sys.charges[i] != 0.0 { req[2] = sys.charges[i]; }
+                if charges[i] != 0.0 { req[2] = charges[i]; }
                 world.uff.reqs.as_mut_slice()[i] = req;
             }
 
             println!("=== Atom types + charges ===");
             for i in 0..world.natoms() {
                 let q = world.uff.reqs.as_slice()[i][2];
-                println!("atom {:3} el {:2} type {:6} Q {:8.4}", i, sys.elems[i], uff_types[i], q);
+                println!("atom {:3} el {:2} type {:6} Q {:8.4}", i, elems[i], uff_types[i], q);
             }
 
             for ib in 0..world.uff.nbonds as usize {
                 let b = world.uff.bon_atoms.as_slice()[ib];
                 let ia = b[0] as usize;
                 let ja = b[1] as usize;
-                let a = sys.elems[ia].as_str();
-                let b = sys.elems[ja].as_str();
+                let a = elems[ia].as_str();
+                let b = elems[ja].as_str();
                 if let Some(bp) = params.get_bond_param(a, b, 1) {
                     world.uff.bon_params.as_mut_slice()[ib] = [bp.k, bp.l0];
                 } else {
@@ -838,9 +1026,9 @@ async fn main() {
                 let i0 = ang[0] as usize;
                 let i1 = ang[1] as usize;
                 let i2 = ang[2] as usize;
-                let a = sys.elems[i0].as_str();
-                let b = sys.elems[i1].as_str();
-                let c = sys.elems[i2].as_str();
+                let a = elems[i0].as_str();
+                let b = elems[i1].as_str();
+                let c = elems[i2].as_str();
                 let ap = params.get_angle_param(a, b, c).unwrap_or_else(|| panic!("missing angle param for {}-{}-{}", a, b, c));
 
                 let th0 = ap.a0.to_radians();
@@ -852,10 +1040,42 @@ async fn main() {
                 let c0 = c2 * (2.0 * ct * ct + 1.0);
                 world.uff.ang_params.as_mut_slice()[ia] = [ap.k, c0, c1, c2, 0.0];
             }
+
+            for id in 0..world.uff.ndihedrals as usize {
+                let d = world.uff.dih_atoms.as_slice()[id];
+                let a = uff_types[d.x as usize].as_str();
+                let b = uff_types[d.y as usize].as_str();
+                let c = uff_types[d.z as usize].as_str();
+                let e = uff_types[d.w as usize].as_str();
+                if let Some(dp) = params.get_dihedral_param(a, b, c, e, 1) {
+                    let a0 = dp.a0.to_radians();
+                    let n = dp.n as f64;
+                    let phase = n * a0;
+                    let s = phase.sin().abs();
+                    if s > 1e-3 {
+                        panic!("dihedral phase not supported by current Uff dihedral form: {}-{}-{}-{} a0={}deg n={} => n*a0={}deg", a, b, c, e, dp.a0, dp.n, phase.to_degrees());
+                    }
+                    let dsign = if phase.cos() >= 0.0 { 1.0 } else { -1.0 };
+                    world.uff.dih_params.as_mut_slice()[id] = [dp.k, dsign, dp.n as f64];
+                } else {
+                    world.uff.dih_params.as_mut_slice()[id] = [0.0, 1.0, 3.0];
+                }
+            }
+
+            for ii in 0..world.uff.ninversions as usize {
+                let inv = world.uff.inv_atoms.as_slice()[ii];
+                let ic = inv.x as usize;
+                let t = uff_types[ic].as_str();
+                if matches!(t, "C_R"|"C_2"|"N_R"|"O_2"|"O_R") {
+                    world.uff.inv_params.as_mut_slice()[ii] = [50.0, 1.0, -1.0, 0.0];
+                } else {
+                    world.uff.inv_params.as_mut_slice()[ii] = [0.0, 1.0, -1.0, 0.0];
+                }
+            }
         } else {
             for i in 0..world.natoms() {
                 let mut req = [1.5, 0.1, 0.0, 0.0];
-                if sys.charges[i] != 0.0 { req[2] = sys.charges[i]; }
+                if charges[i] != 0.0 { req[2] = charges[i]; }
                 world.uff.reqs.as_mut_slice()[i] = req;
             }
             let apos = world.uff.apos.as_slice();
@@ -880,13 +1100,14 @@ async fn main() {
     world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_VDW, Q_AMP, PLQ_AMP);
     println!("Surface setup complete (NaCl lattice a={} Å)", LATTICE_A);
 
-    let mut app = App::new(world, sys.elems, params);
+    let mut app = App::new(world, elems, params, group_size);
     println!("App initialized. Starting render loop.");
     println!("Controls: H=help  SPACE=relax  S=surface  B=bonds  P=pin  ESC=deselect");
 
     loop {
         app.handle_input();
         app.do_relax_step();
+        if app.show_groups { app.rebuild_groups(); }
         app.draw();
 
         next_frame().await;

@@ -13,6 +13,24 @@ impl Complex {
     }
 }
 
+pub struct SurfaceScratch {
+    pub bx: Vec<f64>, pub by: Vec<f64>, pub bz: Vec<f64>,
+    pub dbx: Vec<f64>, pub dby: Vec<f64>, pub dbz: Vec<f64>,
+    pub cux: Vec<f64>, pub sux: Vec<f64>,
+    pub cvy: Vec<f64>, pub svy: Vec<f64>,
+}
+
+impl SurfaceScratch {
+    pub fn new(surf: &SurfaceFolded) -> Self {
+        Self {
+            bx: vec![0.0; surf.nx], by: vec![0.0; surf.ny], bz: vec![0.0; surf.nz],
+            dbx: vec![0.0; surf.nx], dby: vec![0.0; surf.ny], dbz: vec![0.0; surf.nz],
+            cux: vec![0.0; surf.kx_max + 1], sux: vec![0.0; surf.kx_max + 1],
+            cvy: vec![0.0; surf.ky_max + 1], svy: vec![0.0; surf.ky_max + 1],
+        }
+    }
+}
+
 /// Precompute cos(n·φ), sin(n·φ) for n=0..nmax using complex recurrence.
 /// n=0: cos=1, sin=0; n>=1: z^n where z=exp(i·φ), computed by recurrence.
 /// Only 1 cos/sin call + nmax complex multiplies for all harmonics.
@@ -122,6 +140,9 @@ pub struct SurfaceFolded {
     pub coeffs_p: Vec<f64>,  // Pauli repulsion
     pub coeffs_l: Vec<f64>,  // London dispersion
     pub ntypes: usize,
+
+    pub kx_int: Option<Vec<usize>>, pub ky_int: Option<Vec<usize>>,
+    pub kx_max: usize, pub ky_max: usize,
 }
 
 impl SurfaceFolded {
@@ -135,6 +156,21 @@ impl SurfaceFolded {
         let nz = kz.len();
         let nbasis = nx * ny * nz;
         let ncoef = ntypes * nbasis;
+
+        let (kx_int, kx_max) = if all_integer_harmonics(&kx) {
+            let vi: Vec<usize> = kx.iter().map(|&ki| ki.round() as usize).collect();
+            let km = vi.iter().copied().max().unwrap_or(0);
+            (Some(vi), km)
+        } else {
+            (None, 0)
+        };
+        let (ky_int, ky_max) = if all_integer_harmonics(&ky) {
+            let vi: Vec<usize> = ky.iter().map(|&ki| ki.round() as usize).collect();
+            let km = vi.iter().copied().max().unwrap_or(0);
+            (Some(vi), km)
+        } else {
+            (None, 0)
+        };
         Self {
             ax, bx, ay, by,
             inv_ax: by * idet,  inv_bx: -bx * idet,
@@ -144,10 +180,57 @@ impl SurfaceFolded {
             coeffs_p: vec![0.0; ncoef],
             coeffs_l: vec![0.0; ncoef],
             ntypes,
+
+            kx_int, ky_int, kx_max, ky_max,
         }
     }
 
     #[inline(always)] pub fn nbasis(&self) -> usize { self.nx * self.ny * self.nz }
+
+    #[inline(always)] fn precompute_1d_bases_scratch(&self, u: f64, v: f64, z: f64, s: &mut SurfaceScratch) {
+        let nx = self.nx;
+        let ny = self.ny;
+        let nz = self.nz;
+
+        if let Some(ref kx_int) = self.kx_int {
+            if self.kx_max > 0 { precompute_harmonics(TAU * u, self.kx_max, &mut s.cux, &mut s.sux); }
+            else { s.cux[0] = 1.0; s.sux[0] = 0.0; }
+            for i in 0..nx {
+                let n = kx_int[i];
+                s.bx[i] = s.cux[n];
+                s.dbx[i] = -TAU * self.kx[i] * s.sux[n];
+            }
+        } else {
+            for i in 0..nx {
+                let phi = TAU * self.kx[i] * u;
+                s.bx[i] = phi.cos();
+                s.dbx[i] = -TAU * self.kx[i] * phi.sin();
+            }
+        }
+
+        if let Some(ref ky_int) = self.ky_int {
+            if self.ky_max > 0 { precompute_harmonics(TAU * v, self.ky_max, &mut s.cvy, &mut s.svy); }
+            else { s.cvy[0] = 1.0; s.svy[0] = 0.0; }
+            for i in 0..ny {
+                let n = ky_int[i];
+                s.by[i] = s.cvy[n];
+                s.dby[i] = -TAU * self.ky[i] * s.svy[n];
+            }
+        } else {
+            for i in 0..ny {
+                let phi = TAU * self.ky[i] * v;
+                s.by[i] = phi.cos();
+                s.dby[i] = -TAU * self.ky[i] * phi.sin();
+            }
+        }
+
+        for i in 0..nz {
+            let dz = (z - self.z0[i]).max(0.0);
+            let bz_i = (-self.kz[i] * dz).exp();
+            s.bz[i] = bz_i;
+            s.dbz[i] = if z > self.z0[i] { -self.kz[i] * bz_i } else { 0.0 };
+        }
+    }
 
     /// Set coefficients for atom type `ityp` and basis index `ib` (flattened ix,iy,iz)
     #[inline(always)] pub fn set_coeffs(&mut self, ityp: usize, ib: usize, q: f64, p: f64, l: f64) {
@@ -166,23 +249,21 @@ impl SurfaceFolded {
         [c_p, c_l, req[2], req[3]]
     }
 
-    /// Evaluate energy and force for one atom.
-    /// Steps: 1) precompute 1D bases, 2) tensor-product accumulate with coefficients.
     #[inline(always)] pub fn eval_atom(&self, pos: Vec3d, ityp: usize, req: [f64; 4]) -> (f64, Vec3d) {
+        let mut scratch = SurfaceScratch::new(self);
+        self.eval_atom_scratch(pos, ityp, req, &mut scratch)
+    }
+
+    /// Evaluate energy and force for one atom using reusable scratch buffers (no per-atom allocations).
+    #[inline(always)] pub fn eval_atom_scratch(&self, pos: Vec3d, ityp: usize, req: [f64; 4], s: &mut SurfaceScratch) -> (f64, Vec3d) {
         if ityp >= self.ntypes { return (0.0, VEC3_ZERO); }
 
-        // Fractional coordinates
         let u = self.inv_ax * pos.x + self.inv_ay * pos.y;
         let v = self.inv_bx * pos.x + self.inv_by * pos.y;
         let u = u - u.floor();
         let v = v - v.floor();
 
-        // Precompute all 1D bases (THE OPTIMIZATION)
-        let mut bx  = vec![0.0f64; self.nx];  let mut dbx = vec![0.0f64; self.nx];
-        let mut by  = vec![0.0f64; self.ny];  let mut dby = vec![0.0f64; self.ny];
-        let mut bz  = vec![0.0f64; self.nz];  let mut dbz = vec![0.0f64; self.nz];
-        precompute_1d_bases(u, v, pos.z, &self.kx, &self.ky, &self.kz, &self.z0,
-                            &mut bx, &mut by, &mut bz, &mut dbx, &mut dby, &mut dbz);
+        self.precompute_1d_bases_scratch(u, v, pos.z, s);
 
         let plq = Self::req2plq(req, 2.0);
         let ioff = ityp * self.nbasis();
@@ -193,24 +274,20 @@ impl SurfaceFolded {
         let mut dEdv = 0.0;
         let mut dEdz = 0.0;
 
-        // Triple loop: tensor product combination
         for iz in 0..self.nz {
-            let bz_iz = bz[iz];
-            let dbz_iz = dbz[iz];
+            let bz_iz = s.bz[iz];
+            let dbz_iz = s.dbz[iz];
             for iy in 0..self.ny {
-                let by_iy = by[iy];
-                let dby_iy = dby[iy];
-                // Precompute z-y combos
+                let by_iy = s.by[iy];
+                let dby_iy = s.dby[iy];
                 let bz_by = bz_iz * by_iy;
                 let dbz_by = dbz_iz * by_iy;
                 let bz_dby = bz_iz * dby_iy;
                 for ix in 0..self.nx {
-                    let c = self.coeffs_q[ic] * req[2]
-                        + self.coeffs_p[ic] * plq[0]
-                        + self.coeffs_l[ic] * plq[1];
+                    let c = self.coeffs_q[ic] * req[2] + self.coeffs_p[ic] * plq[0] + self.coeffs_l[ic] * plq[1];
                     ic += 1;
-                    let bx_ix = bx[ix];
-                    let dbx_ix = dbx[ix];
+                    let bx_ix = s.bx[ix];
+                    let dbx_ix = s.dbx[ix];
                     e_tot  += c * (bx_ix * bz_by);
                     dEdu   += c * (dbx_ix * bz_by);
                     dEdv   += c * (bx_ix * bz_dby);
@@ -228,9 +305,15 @@ impl SurfaceFolded {
 
     /// Evaluate for all atoms, accumulate forces into `fapos`
     pub fn eval_all(&self, apos: &[Vec3d], atom_types: &[usize], reqs: &[[f64; 4]], fapos: &mut [Vec3d]) -> f64 {
+        let mut scratch = SurfaceScratch::new(self);
+        self.eval_all_scratch(apos, atom_types, reqs, fapos, &mut scratch)
+    }
+
+    /// Evaluate for all atoms, reusing scratch buffers (no per-atom allocations).
+    pub fn eval_all_scratch(&self, apos: &[Vec3d], atom_types: &[usize], reqs: &[[f64; 4]], fapos: &mut [Vec3d], scratch: &mut SurfaceScratch) -> f64 {
         let mut etot = 0.0;
         for ia in 0..apos.len() {
-            let (e, f) = self.eval_atom(apos[ia], atom_types[ia], reqs[ia]);
+            let (e, f) = self.eval_atom_scratch(apos[ia], atom_types[ia], reqs[ia], scratch);
             etot += e;
             fapos[ia].add(f);
         }

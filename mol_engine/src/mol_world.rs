@@ -2,7 +2,7 @@ use mol_utils::math::vec3::{Vec3d, VEC3_ZERO};
 use mol_topology::topology::Topology;
 use crate::uff::Uff;
 use crate::nonbonded::NonBondedFF;
-use crate::surface::SurfaceFolded;
+use crate::surface::{SurfaceFolded, SurfaceScratch};
 use crate::rigid_sp3::RigidSp3FF;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -69,11 +69,8 @@ impl MolWorld {
 
         // Surface interaction
         if let Some(ref surf) = self.surface {
-            for ia in 0..natoms {
-                let (e, f) = surf.eval_atom(uff_apos[ia], sat[ia], uff_reqs[ia]);
-                es += e;
-                uff_fapos[ia].add(f);
-            }
+            let mut scratch = SurfaceScratch::new(surf);
+            es = surf.eval_all_scratch(&uff_apos[0..natoms], &sat[0..natoms], &uff_reqs[0..natoms], &mut uff_fapos[0..natoms], &mut scratch);
         }
 
         (eb, ea, ed, ei, enb, es)

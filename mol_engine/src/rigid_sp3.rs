@@ -8,6 +8,9 @@ pub struct RigidSp3FF {
     pub tau: Vec<Vec3d>,
     pub k_scale: f64,
     pub rot_damp: f64,
+
+    pub nport: Vec<u8>,
+    pub port_local: Vec<Vec3d>,
 }
 
 impl RigidSp3FF {
@@ -18,10 +21,20 @@ impl RigidSp3FF {
             tau: vec![VEC3_ZERO; natoms],
             k_scale: 1.0,
             rot_damp: 0.05,
+
+            nport: vec![4u8; natoms],
+            port_local: vec![VEC3_ZERO; natoms * 4],
         }
     }
 
-    #[inline(always)] pub fn from_uff(uff: &Uff) -> Self { Self::new(uff.natoms as usize) }
+    #[inline(always)] pub fn from_uff(uff: &Uff) -> Self {
+        let natoms = uff.natoms as usize;
+        let mut out = Self::new(natoms);
+        for i in 0..natoms {
+            out.set_sp3(i);
+        }
+        out
+    }
 
     #[inline(always)] fn quat_normalize(mut q: Quat4d) -> Quat4d {
         let n2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
@@ -59,14 +72,62 @@ impl RigidSp3FF {
         Quat4d::new(omega.x*invw*s, omega.y*invw*s, omega.z*invw*s, c)
     }
 
-    #[inline(always)] fn sp3_dir(slot: usize) -> Vec3d {
+    #[inline(always)] fn set_sp3(&mut self, i: usize) {
         const INV_SQRT3: f64 = 0.57735026918962576451;
-        match slot & 3 {
-            0 => Vec3d::new( 1.0*INV_SQRT3,  1.0*INV_SQRT3,  1.0*INV_SQRT3),
-            1 => Vec3d::new( 1.0*INV_SQRT3, -1.0*INV_SQRT3, -1.0*INV_SQRT3),
-            2 => Vec3d::new(-1.0*INV_SQRT3,  1.0*INV_SQRT3, -1.0*INV_SQRT3),
-            _ => Vec3d::new(-1.0*INV_SQRT3, -1.0*INV_SQRT3,  1.0*INV_SQRT3),
+        self.nport[i] = 4;
+        let o = i * 4;
+        self.port_local[o + 0] = Vec3d::new( 1.0*INV_SQRT3,  1.0*INV_SQRT3,  1.0*INV_SQRT3);
+        self.port_local[o + 1] = Vec3d::new( 1.0*INV_SQRT3, -1.0*INV_SQRT3, -1.0*INV_SQRT3);
+        self.port_local[o + 2] = Vec3d::new(-1.0*INV_SQRT3,  1.0*INV_SQRT3, -1.0*INV_SQRT3);
+        self.port_local[o + 3] = Vec3d::new(-1.0*INV_SQRT3, -1.0*INV_SQRT3,  1.0*INV_SQRT3);
+    }
+
+    #[inline(always)] fn set_sp2(&mut self, i: usize) {
+        self.nport[i] = 3;
+        let o = i * 4;
+        self.port_local[o + 0] = Vec3d::new(1.0, 0.0, 0.0);
+        self.port_local[o + 1] = Vec3d::new(-0.5, 0.8660254037844386, 0.0);
+        self.port_local[o + 2] = Vec3d::new(-0.5, -0.8660254037844386, 0.0);
+        self.port_local[o + 3] = VEC3_ZERO;
+    }
+
+    #[inline(always)] fn set_sp1(&mut self, i: usize) {
+        self.nport[i] = 2;
+        let o = i * 4;
+        self.port_local[o + 0] = Vec3d::new(1.0, 0.0, 0.0);
+        self.port_local[o + 1] = Vec3d::new(-1.0, 0.0, 0.0);
+        self.port_local[o + 2] = VEC3_ZERO;
+        self.port_local[o + 3] = VEC3_ZERO;
+    }
+
+    #[inline(always)] fn set_point(&mut self, i: usize) {
+        self.nport[i] = 0;
+        let o = i * 4;
+        self.port_local[o + 0] = VEC3_ZERO;
+        self.port_local[o + 1] = VEC3_ZERO;
+        self.port_local[o + 2] = VEC3_ZERO;
+        self.port_local[o + 3] = VEC3_ZERO;
+    }
+
+    pub fn set_port_geometry_from_types(&mut self, uff_types: &[String]) {
+        assert_eq!(uff_types.len(), self.quat.len());
+        for i in 0..uff_types.len() {
+            let t = uff_types[i].as_str();
+            if matches!(t, "C_R"|"C_2"|"N_R"|"O_2"|"O_R") {
+                self.set_sp2(i);
+            } else if matches!(t, "C_1"|"N_1") {
+                self.set_sp1(i);
+            } else if t == "H_" {
+                self.set_point(i);
+            } else {
+                self.set_sp3(i);
+            }
         }
+    }
+
+    #[inline(always)] pub fn get_port_tip(&self, uff: &Uff, i: usize, slot: usize, l0: f64) -> Vec3d {
+        let r0 = self.port_local[i * 4 + slot] * l0;
+        uff.apos.as_slice()[i] + Self::quat_rotate(self.quat[i], r0)
     }
 
     pub fn eval_forces(&mut self, uff: &mut Uff) -> f64 {
@@ -90,18 +151,21 @@ impl RigidSp3FF {
             let ns = neighs[i].as_array();
             let bs = neigh_bs[i].as_array();
 
+            let np = self.nport[i] as usize;
+
             for s in 0..4 {
                 let j = ns[s];
                 if j < 0 { continue; }
                 let ib = bs[s];
                 if ib < 0 { continue; }
+                if s >= np { continue; }
 
                 let par = bon_params[ib as usize];
                 let k = par[0] * self.k_scale;
                 if k <= 0.0 { continue; }
                 let l0 = par[1];
 
-                let r0 = Self::sp3_dir(s) * l0;
+                let r0 = self.port_local[i * 4 + s] * l0;
                 let r = Self::quat_rotate(q, r0);
                 let tip = xi + r;
 

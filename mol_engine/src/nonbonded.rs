@@ -19,6 +19,8 @@ pub struct NonBondedFF {
     pub rdamp: f64,
     pub fmax_nonbonded: f64,
     pub b_clamp_nonbonded: bool,
+
+    pub rcut2: f64,
 }
 
 impl NonBondedFF {
@@ -41,8 +43,12 @@ impl NonBondedFF {
             rdamp: 0.1,
             fmax_nonbonded: 10.0,
             b_clamp_nonbonded: true,
+
+            rcut2: 1e300,
         }
     }
+
+    #[inline(always)] pub fn set_cutoff(&mut self, rcut: f64) { self.rcut2 = rcut * rcut; }
 
     /// Build sorted exclusion list of 1-2 and 1-3 neighbors for each atom.
     pub fn make_second_neighs(&mut self, neighs: &[Quat4i], natoms: usize) {
@@ -143,6 +149,7 @@ impl NonBondedFF {
         let mut e = 0.0;
         let r2damp = self.rdamp * self.rdamp;
         let f2max = self.fmax_nonbonded * self.fmax_nonbonded;
+        let rcut2 = self.rcut2;
         for ja in 0..self.natoms {
             if ja == ia { continue; }
             if jex != -1 {
@@ -151,6 +158,7 @@ impl NonBondedFF {
             }
             if jex == ja as i32 { continue; }
             let dp = Vec3d::set_sub(apos[ja], pi);
+            if dp.norm2() > rcut2 { continue; }
             let reqj = self.reqs.as_slice()[ja];
             let reqij = Self::combine_req(reqj, reqi);
             let (eij, mut fij) = Self::get_ljqh(dp, reqij, r2damp);
