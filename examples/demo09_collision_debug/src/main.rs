@@ -171,7 +171,10 @@ async fn main() {
     let margin = parse_arg_f32(&args, "--margin", 1.5);
     let atom_r = parse_arg_f32(&args, "--atom-r", 0.6);
 
-    let workspace_root = std::env::current_dir().unwrap();
+    let workspace_root = std::env::current_dir().unwrap()
+        .ancestors().nth(2)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
     let xyz_path = parse_arg_path(&args).unwrap_or_else(|| workspace_root.join("examples/demo07_uff_forcefield/water.xyz"));
 
     println!("XYZ: {:?}", xyz_path);
