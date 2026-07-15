@@ -9,6 +9,7 @@ members = [
     "examples/demo07_uff_forcefield",
     "examples/demo08_molecule_viewer",
     "examples/demo09_collision_debug",
+    "examples/demo10_collision_balls",
     "mol_utils",
     "mol_topology",
     "mol_engine",

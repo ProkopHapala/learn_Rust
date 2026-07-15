@@ -1,0 +1,10 @@
+[package]
+name = "demo10_collision_balls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ocl = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+rand = { workspace = true }
