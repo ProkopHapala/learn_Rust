@@ -234,6 +234,47 @@ cd demo06_opencl_opengl_interop && cargo run
 
 ---
 
+### Demo 10: OpenCL Collision Balls with AABB Groups
+
+**Location:** `demo10_collision_balls/`
+
+**Purpose:** Demonstrates fixed-width particle groups, group AABBs, exact group-overlap classification, GPU narrow-phase collision, and CPU-side spatial rebalancing.
+
+**Run:**
+```bash
+cargo run -p demo10_collision_balls
+```
+
+See its README and `ImprovementSuggestions.md` for the group-based architecture and rebalancing experiments.
+
+---
+
+### Demo 11: OpenCL Collision Grid
+
+**Location:** `demo11_collision_grid/`
+
+**Purpose:** Provides the uniform-grid comparison to Demo 10. Its main lesson is
+that a cheap, regularly rebuilt spatial index can make neighbor ownership
+clearer and more scalable than fixed AABB groups, while leaving the collision
+response as a separate concern.
+
+**Run:**
+```bash
+cargo run -p demo11_collision_grid
+```
+
+Run the GPU/CPU structural and contact-parity validation with:
+```bash
+cargo run -p demo11_collision_grid -- --smoke
+```
+
+This is a particle-cell neighbor-search demo, not a classical PIC field
+solver. Read its README for the design rationale, interaction model, caveats,
+and the current TODO list. Its current scope is equal-radius 2D soft-contact
+particles.
+
+---
+
 ## Learning Path
 
 Recommended order for learning:
@@ -244,6 +285,8 @@ Recommended order for learning:
 4. **Demo 3** - Understand compute patterns (CPU version)
 5. **Demo 4** - Modern GPU compute with WGPU
 6. **Demo 6** - Understand why OpenCL+OpenGL interop is not recommended
+7. **Demo 10** - Explore AABB-group collision broad phases and GPU/CPU rebalancing
+8. **Demo 11** - Compare a compact uniform-grid particle-cell broad phase
 
 ## Key Crates Used
 
@@ -255,9 +298,9 @@ Recommended order for learning:
 | `nalgebra` | Linear algebra | 2 |
 | `wgpu` | Modern GPU compute/graphics | 4 |
 | `winit` | Windowing | 4 |
-| `ocl` | OpenCL bindings | 3, 6 |
+| `ocl` | OpenCL bindings | 3, 6, 10, 11 |
 | `bytemuck` | Safe memory casting | 4, 5 |
-| `rand` | Random numbers | 2, 3, 4, 6 |
+| `rand` | Random numbers | 2, 3, 4, 6, 10, 11 |
 
 ## Migration from C++
 

@@ -1312,6 +1312,70 @@ The most important optimization decisions, in approximate order, are:
 
 For your style of GPU programming, the best first production design is likely an **atomic-free radix-sorted compact grid with particle-centric full-list gather**, followed by a **Verlet/cluster list**. Shared-memory cell kernels should be a measured high-occupancy specialization, not the starting assumption.
 
+# Repository implementation status
+
+The first working implementation of this design is
+[demo11_collision_grid](../examples/demo11_collision_grid/README.md). It is a
+deliberately bounded, two-dimensional baseline: equal-radius particles in a
+`[-20,20]^2` domain, a dense `200 x 200` grid, and a nine-cell stencil.
+
+The purpose of this implementation is to establish trustworthy ownership and
+validation boundaries before optimizing construction. The grid is rebuilt from
+the current particle snapshot, counts are converted to compact cell ranges by
+a GPU scan, and particles are scattered into a cell-contiguous snapshot. The
+collision pass then gathers from that same sorted snapshot and writes a
+separate next snapshot. This pairing of metadata, read-only input, and
+ping-pong output is the central correctness invariant; it prevents stale or
+unsorted data from being interpreted as a cell list and avoids global
+read/write races between workgroups.
+
+The implementation uses integer count/scan/scatter construction rather than
+the radix-sort variant recommended above. That choice keeps the baseline
+short, GPU-resident, and free of fixed per-cell overflow. It does mean that
+the order inside a cell is not guaranteed to be deterministic. A future radix
+sort can address reproducible ordering and may also improve memory locality,
+but it should be evaluated rather than assumed to be faster for this workload.
+
+The collision pass intentionally evaluates each pair once from each
+destination particle. This duplicates arithmetic, but gives every work item
+ownership of its own output and avoids floating-point atomics. The force model
+is an explicit soft penalty, so the demo tests neighbor-search behavior; it is
+not evidence that the time integration is a robust hard-contact or CCD method.
+Near-coincident centers use a stable ID-based antisymmetric normal. That keeps
+the computation defined at a singular configuration, while the reported
+counter makes the event visible instead of hiding it.
+
+The smoke check is the acceptance test for changes to this baseline:
+
+```bash
+cargo run -p demo11_collision_grid -- --smoke
+```
+
+It checks scan offsets, range coverage, particle identity, finite and bounded
+state, pair symmetry, and exact contact-count parity with an exhaustive CPU
+all-pairs reference. The validated run currently reports 31, 32, and 32
+contacts over its three iterations.
+
+## Open issues and unfinished work
+
+The implementation is a validated teaching and comparison baseline, not the
+final solver proposed by the design discussion. The main unfinished work is:
+
+- reuse neighbor information with a Verlet/skin list;
+- benchmark grid construction and collision traversal against demo10 across
+  uniform, clustered, and moving distributions;
+- add timestep control, substepping or CCD, and eventually a hard-contact
+  iterative solver;
+- support variable radii and determine when a multilevel grid is necessary;
+- specialize crowded cells and investigate sparse hashed storage for larger
+  or mostly empty domains;
+- evaluate deterministic radix sorting when reproducibility matters; and
+- remove CPU visualization readback from performance-oriented runs.
+
+These are open design questions, not hidden fallbacks. In particular, the
+current singular-normal handling is a numerical guard, not a substitute for a
+physically complete coincident-particle policy.
+
 [1]: https://developer.nvidia.com/gpugems/gpugems3/part-v-physics-simulation/chapter-32-broad-phase-collision-detection-cuda "Chapter 32. Broad-Phase Collision Detection with CUDA | NVIDIA Developer"
 [2]: https://docs.lammps.org/package.html?utm_source=chatgpt.com "package command"
 [3]: https://github.com/iweinbau/UnityGPUDynamicHashGrid "GitHub - iweinbau/UnityGPUDynamicHashGrid: Implementation of a dynamic hash grid on the GPU · GitHub"
@@ -1326,6 +1390,3 @@ For your style of GPU programming, the best first production design is likely an
 [12]: https://www.mdpi.com/2673-3951/7/1/27 "GPU-Accelerated FLIP Fluid Simulation Based on Spatial Hashing Index and Thread Block-Level Cooperation | MDPI"
 [13]: https://arxiv.org/html/2601.15633v1 "Advancing RT Core-Accelerated Fixed-Radius Nearest Neighbor Search"
 [14]: https://www.reddit.com/r/GraphicsProgramming/comments/a901xv/hash_table_particle_collision_w_compute_shaders/ "Hash Table Particle collision w/ Compute Shaders : r/GraphicsProgramming"
-
-
-

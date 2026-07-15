@@ -1,146 +1,175 @@
-# demo10_collision_balls — OpenCL Collision Simulation with Group-Based Broad Phase
+# demo10_collision_balls
 
-## Overview
+This demo studies a deliberately simple GPU collision architecture:
 
-GPU-accelerated 2D particle collision simulation using OpenCL, with host-side
-spatial rebalancing to maintain collision detection performance over time.
+```text
+contiguous particle groups
+        -> group AABBs
+        -> exact group-overlap map
+        -> group-owned collision gathers
+```
 
-**Scale**: 16,384 particles (2^14), 512 groups of W=32. Box [-20,20]^3, 2D mode (y=0).
+It is not intended to be a finished physics engine. Its purpose is to make the
+cost, ownership, synchronization, and failure modes of a group-based broad
+phase visible before comparing it with the uniform-grid approach in
+[`demo11_collision_grid`](../demo11_collision_grid/).
 
-## Architecture: GPU/CPU Split
+## Purpose and motivation
 
-### GPU (OpenCL) — every frame
+The collision kernel works best when nearby particles are also nearby in the
+flat particle array. A workgroup can then load one compact tile and reuse it
+while checking many particle pairs. The difficulty is that particles move, so
+the original grouping gradually becomes a poor spatial partition.
 
-| Kernel | Purpose | Complexity |
-|--------|---------|-----------|
-| `compute_aabbs` | Per-group AABB (min/max via tree reduction in local memory) | O(W) per group |
-| `compute_overlaps` | Tiled group-vs-all-groups AABB overlap detection | O(m) per group, O(m^2/W) total |
-| `collision_step` | Narrow-phase collision forces + integration, using overlap list for pruning | O(W^2 * mColAv) per group |
+This demo explores how much can be gained by maintaining those fixed-size
+groups without making the physics kernel responsible for changing its own
+memory layout.
 
-**Execution order per frame**:
-1. `compute_aabbs` — from current particle positions
-2. `compute_overlaps` — from AABBs
-3. `collision_step` — uses overlap list to skip non-overlapping groups
+The default scene contains 16,384 particles in 512 groups of 32. It is a
+2D simulation in the x-z plane; the buffers retain a 3D-shaped layout so the
+data model remains compatible with the other examples.
 
-### CPU (Rust) — rare, on-demand
+## Design principles
 
-| Operation | When | Purpose |
-|-----------|------|---------|
-| `sort_by_morton` | Init + button press | Full spatial reorder via Morton Z-curve |
-| `rebalance_swaps` | Button / auto-rebuild | Greedy pairwise particle swaps to reduce AABB surface |
-| `rebalance_retile` | Button / auto-rebuild | 2W->W+W merge-sort-split for overlapping pairs |
-| Mouse interaction | Every frame (if active) | LMB drag particle, RMB radial force |
-| Quality metrics display | Every frame | Read overlap_count buffer, compute total surface |
+The implementation is guided by a few constraints:
 
-## Broad-Phase Algorithm
+- Workgroups have exactly 32 active particles. Occupancy is part of the data
+  structure, not an incidental optimization.
+- A collision step reads one immutable particle snapshot and writes another.
+  OpenCL workgroups cannot provide a general global barrier inside a kernel, so
+  in-place neighbor reads are not safe.
+- Each destination group owns its accumulated forces and output particles.
+  A pair is evaluated from both sides; this costs arithmetic but avoids force
+  atomics and ambiguous write ownership.
+- Broad-phase data is conservative. A group AABB includes particle radii, so
+  a non-overlapping pair of boxes is safe to skip, while an overlapping pair is
+  only a candidate and still requires particle-level testing.
+- Unexpected states are exposed. Overlap-map asymmetry, invalid degrees,
+  non-finite state, and pathological group degrees are diagnostics, not silent
+  fallback cases.
 
-Particles are partitioned into fixed-size groups of W=32. Each group has an AABB
-that includes particle radii (broad box). Two groups whose broad AABBs do not
-overlap cannot contain colliding particle pairs, so their W x W interaction is
-skipped entirely.
+## Frame interaction
 
-**AABB margin**: The AABB is computed as `[p.xyz - r, p.xyz + r]` per particle,
-so the group box already includes the collision radius. Two groups overlap iff
-any particle pair could be within `2R` — exactly the collision-relevant
-threshold. No additional margin is needed.
+Each frame follows this conceptual sequence:
 
-**Complexity**: With m groups, W group size, and mColAv average overlaps:
-- Broad phase: O(m^2 / W) (tiled, each workgroup scans all m groups)
-- Narrow phase: O(W^2 * m * mColAv) vs brute-force O(W^2 * m^2)
-- With m=512, mColAv~8: ~64x fewer particle-particle checks
+```text
+current positions
+    -> group AABBs
+    -> exact overlap bit matrix and degrees
+    -> normal collision kernel
+    -> pathological collision kernel, if needed
+    -> next positions
+    -> swap current/next buffers
+```
 
-## Overlap List Representation
+The normal and pathological kernels use the same snapshot and write disjoint
+group ranges. A group with at most 32 neighboring groups uses the bounded fast
+path. A group with more than 32 neighbors is not truncated or ignored: it is
+handled by a separate complete path.
 
-Each group stores up to `MAX_OVERLAP=32` partner group IDs in a fixed-size array.
-The true overlap count is stored separately in `overlap_count[g]`.
+The value 32 is therefore a performance boundary and a repair signal, never a
+correctness capacity.
 
-**Overflow handling**: If a group has more than 32 overlapping partners, the list
-is truncated (non-deterministic which partners are kept, due to atomic increment
-ordering). The count is always correct. Collisions with unlisted groups are
-**missed** — this is a correctness gap, not just a performance issue.
+## Why the overlap map is a bit matrix
 
-**Overflow as pathology signal**: A group exceeding MAX_OVERLAP is pathologically
-spread out. The `Overflow groups` counter in the UI should trigger aggressive
-rebalancing (Morton rebuild or common-pool reassignment). In normal operation
-with compact groups, mColAv should be ~4-12.
+The old fixed partner list made overflow a correctness bug: once a group had
+too many partners, some collisions disappeared. The current representation
+stores one exact bit per possible group pair. For 512 groups this is only 32 KiB
+and gives deterministic degrees without atomics or dynamic allocation.
 
-## Rebalancing Heuristics (CPU)
+The same map is useful outside the collision kernel. When a repair is needed,
+the CPU reads the GPU-produced map and considers only actual overlapping group
+pairs. It does not rediscover the complete group graph with a second CPU-wide
+search.
 
-### Morton Z-curve Rebuild
-Full O(N log N) sort of all particles by 2D Morton code. Produces optimal
-spatial locality but is expensive and disrupts all groups simultaneously.
+## Rebalancing and its interaction with physics
 
-### Greedy Swaps
-For each group, find the particle that most extends its AABB. If that particle
-falls inside another group's AABB, find a swap partner and accept if total
-AABB surface decreases. Limited to `max_swaps` per call.
+Rebalancing is intentionally outside the normal collision kernel. Changing
+group membership while another workgroup is reading the groups would create
+duplicate, missing, or partially updated particles.
 
-**Caveat**: Greedy one-at-a-time swaps can miss cooperative improvements where
-two particles need to move together for any gain. The balanced merge-split
-approach (planned) handles this better.
+The UI offers four policies:
 
-### 2W->W+W Retiling
-For overlapping group pairs (sorted by overlap area), merge all 2W particles,
-sort by the longest axis of the combined bounding box, split at median.
-Accept if total surface decreases.
+- `2W retile` is the default. Two neighboring groups are merged, then split
+  into two full groups using x, z, and center-line candidate partitions.
+- `Greedy swaps` exchanges individual records between GPU-reported neighbors.
+  It is cheap but can miss improvements that require several particles to move
+  together.
+- `Swaps + retile` applies both local heuristics in one CPU snapshot.
+- `Morton rebuild` globally reorders all particles and is the broad repair
+  fallback. It is effective but disruptive and expensive.
 
-**Caveat**: Sorting by the longest single axis (x or z) is suboptimal when
-groups are offset diagonally. The planned improvement is to sort by projection
-onto the line connecting group centers (Delta_i = |x_i - c_A|^2 - |x_i - c_B|^2),
-which is the optimal balanced partition for fixed centers.
+Repairs are interval-gated. The GPU fallback continues to preserve correctness
+between repair intervals, so persistent pathology does not force a CPU repair
+on every frame. The default trigger is deliberately below the hard degree
+boundary, leaving room for the local repair to work before the slow path is
+needed.
 
-## Non-Obvious Design Decisions
+Accepted repairs preserve exact group occupancy and keep position/velocity
+records together. Repair decisions first prefer fewer incident AABB overlaps,
+then smaller perimeter. This is closer to the actual broad-phase cost than a
+centroid-distance-only heuristic.
 
-1. **Groups are contiguous index ranges** (group g = particles [g*W, (g+1)*W)).
-   No separate group membership array. Rebalancing = permuting particles in
-   the flat pos/vel arrays. This keeps GPU kernels simple (group_id = global_id / W).
+## Non-obvious context and caveats
 
-2. **AABB computed redundantly on CPU** inside rebalancing functions
-   (`compute_group_aabbs_host`) to evaluate swap/retile quality without
-   round-tripping to GPU. This is intentional — rebalancing is rare and
-   needs to evaluate many candidate swaps quickly.
+The AABB is a broad collision box, not a diagnostic measure of grouping quality.
+Neighboring compact groups can legitimately overlap because their particles
+have finite radii. A future tight-box view of particle centers would help
+distinguish expected contact neighborhoods from badly mixed groups.
 
-3. **2D mode only** (y=0 constraint). The overlap kernel checks only x,z axes.
-   Extending to 3D requires adding y-axis checks in `compute_overlaps` and
-   `aabb_overlap`.
+The collision response is a penalty spring with damping and semi-implicit
+integration. It is useful for studying neighbor-search behavior, but it is not
+a hard-contact or continuous-collision solver. Large timesteps, high stiffness,
+or near-coincident particles can still produce penetration, jitter, or unstable
+motion.
 
-4. **Intra-group collisions checked unconditionally** (g vs g, W^2 pairs).
-   This is always needed and cheap (W=32, so 1024 checks per group).
+The simulation is deterministic with respect to its logical ownership rules,
+but floating-point execution and work-group scheduling on different OpenCL
+devices may still produce different trajectories. The tests validate invariants
+and parity conditions; they are not claiming bitwise cross-device trajectory
+identity.
 
-5. **Wall collision unrolled per-axis** because OpenCL C doesn't support
-   dynamic vector component indexing (`.s[axis]` with variable axis).
+The visualizer performs readback and CPU drawing for inspection. Those costs
+are not representative of a headless production simulation. Rebalancing still
+transfers the complete position and velocity arrays when a CPU repair is
+accepted; GPU candidate discovery has been moved to the bit map, but the final
+CPU layout mutation remains an O(N) operation.
 
-## Open Issues
+## Open issues and unfinished work
 
-- **Overlap list overflow = missed collisions**: When a group has >32 partners,
-  collisions with truncated partners are silently skipped. This is a correctness
-  issue under severe pathology. Mitigation: trigger rebuild before overflow.
+The current design is a validated study implementation, not a finished
+scalable partition manager. Open work includes:
 
-- **No tight-box vs broad-box distinction**: Currently AABBs include particle
-  radius (broad box). For diagnosing grouping quality, tight boxes (centers only)
-  would be better — neighboring compact groups are *expected* to have overlapping
-  broad boxes, but tight-box overlap indicates actual misassignment.
+- Move selected-group gathers, repartitioning, and permutation application to
+  the GPU so repairs do not require full state readback and upload.
+- Add common-pool reassignment for cyclic misplacements involving more than two
+  groups.
+- Unify swaps and retile into one bounded local repair algorithm.
+- Add tight center boxes and better visualization of why a group is considered
+  pathological.
+- Explore whether a persistent/Verlet-style neighbor structure can reduce the
+  per-frame broad-phase rebuild cost.
+- Extend beyond equal-radius 2D particles. Variable radii require a conservative
+  stencil or a different spatial hierarchy.
+- Add stronger contact integration, substepping, or continuous collision
+  detection for fast particles.
+- Benchmark this architecture against the uniform grid across density,
+  clustering, and pathological distributions.
 
-- **Rebalancing reads/writes entire pos+vel arrays**: For 16k particles this is
-  256KB per array, transferred every rebalance call. Could be optimized to
-  transfer only affected groups.
+## Validation and diagnostics
 
-- **No priority queue for repairs**: Overlapping pairs are processed in order of
-  raw overlap area. A pathology score (N_overlap * (D/D_typical)^2) would better
-  prioritize world-spanning groups.
+The tests cover exact overlap bits beyond 32 neighbors, symmetry and degree
+validation, CPU record preservation during retile, immutable ping-pong input,
+and an OpenCL collision whose only meaningful contact is supplied through the
+second bitset word.
 
-## TODO
+The ignored headless benchmark measures broad phase, narrow phase, and one
+GPU-map-driven repair at target scale:
 
-- [ ] Replace axis-based retile split with balanced Delta_i projection onto inter-center line
-- [ ] Unify swaps + retile into single merge-split function (inspect k particles crossing)
-- [ ] Add pathology score for repair prioritization
-- [ ] Add common-pool multi-group reassignment for cyclic misassignments
-- [ ] Add tight-box computation (particle centers only) for diagnosis
-- [ ] GPU kernel to apply permutation (gather) instead of CPU writing full arrays
-- [ ] Two-pass overlap kernel: count pass + fill pass for variable-size lists
-- [ ] Benchmark broad vs narrow phase timing at different mColAv levels
+```bash
+cargo test -p demo10_collision_balls headless_target_scale_benchmark -- --ignored --nocapture
+```
 
-## References
-
-- `NOTES/BoundingBoxBalancing.md` — theoretical analysis of rebalancing strategies
-- `examples/demo09_collision_debug/` — earlier CPU-only collision debug visualization
+For architectural comparison, see
+[`demo11_collision_grid`](../demo11_collision_grid/) and the broader discussion
+in [`PIC_gridHass_collision_acceleration.md`](../../NOTES/PIC_gridHass_collision_acceleration.md).

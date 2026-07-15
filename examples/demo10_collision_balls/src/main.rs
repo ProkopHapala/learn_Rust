@@ -48,15 +48,69 @@ fn sort_by_morton(pos: &mut Vec<f32>, vel: &mut Vec<f32>, box_min: &[f32; 3], bo
 }
 
 const KERNEL_SRC: &str = include_str!("collision_kernel.cl");
-const MAX_OVERLAP: usize = 32;
+const GROUP_SIZE: usize = 32;
+const PATHOLOGICAL_DEGREE: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RebalanceStrategy { Retile, GreedySwaps, SwapsThenRetile, Morton }
+
+impl RebalanceStrategy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Retile => "2W retile",
+            Self::GreedySwaps => "Greedy swaps",
+            Self::SwapsThenRetile => "Swaps + retile",
+            Self::Morton => "Morton rebuild",
+        }
+    }
+}
+
+struct GroupMap {
+    amins: Vec<[f32; 4]>,
+    amaxs: Vec<[f32; 4]>,
+    bits: Vec<u32>,
+    degree: Vec<u32>,
+    n_words: usize,
+}
+
+impl GroupMap {
+    fn has_edge(&self, g: usize, h: usize) -> bool {
+        self.bits[g * self.n_words + h / 32] & (1u32 << (h % 32)) != 0
+    }
+
+    fn validate(&self) {
+        let n_groups = self.degree.len();
+        assert_eq!(self.amins.len(), n_groups);
+        assert_eq!(self.amaxs.len(), n_groups);
+        assert_eq!(self.bits.len(), n_groups * self.n_words);
+        for g in 0..n_groups {
+            assert!(self.amins[g][0].is_finite() && self.amins[g][2].is_finite() && self.amaxs[g][0].is_finite() && self.amaxs[g][2].is_finite(), "non-finite AABB for group {g}");
+            assert!(self.amins[g][0] <= self.amaxs[g][0] && self.amins[g][2] <= self.amaxs[g][2], "invalid AABB for group {g}");
+            assert!(!self.has_edge(g, g), "self-overlap bit set for group {g}");
+            let mut d = 0u32;
+            for word in 0..self.n_words {
+                let mut mask = self.bits[g * self.n_words + word];
+                d += mask.count_ones();
+                while mask != 0 {
+                    let bit = mask.trailing_zeros() as usize;
+                    let h = word * 32 + bit;
+                    assert!(h < n_groups, "tail overlap bit {g}->{h} exceeds group count {n_groups}");
+                    assert!(self.has_edge(h, g), "asymmetric overlap edge {g}->{h}");
+                    mask &= mask - 1;
+                }
+            }
+            assert_eq!(d, self.degree[g], "degree mismatch for group {g}");
+        }
+    }
+}
 
 /// Manages OpenCL buffers and kernels for the collision simulation.
 ///
 /// Buffers:
-///   pos_buf, vel_buf, force_buf — per-particle float4 arrays (N entries)
+///   pos_in/out, vel_in/out — per-particle float4 arrays (N entries)
 ///   aabb_min_buf, aabb_max_buf — per-group float4 AABBs (n_groups entries)
-///   overlap_list_buf — n_groups * MAX_OVERLAP int partner IDs
-///   overlap_count_buf — n_groups int true overlap counts
+///   overlap_bits_buf — exact n_groups * ceil(n_groups / 32) bit matrix
+///   degree_buf — exact overlap degree used for fast/slow-path selection
 ///
 /// Kernels are pre-built with fixed args; only dynamic args (dt, gravity, etc.)
 /// are updated via set_arg in step(). Arg indices must match kernel declaration order.
@@ -66,25 +120,31 @@ const MAX_OVERLAP: usize = 32;
 /// to allow timing broad and narrow phases separately.
 struct CollisionOcl {
     pro_que: ProQue,
-    pos_buf: Buffer<f32>,
-    vel_buf: Buffer<f32>,
-    force_buf: Buffer<f32>,
+    pos_in: Buffer<f32>,
+    vel_in: Buffer<f32>,
+    pos_out: Buffer<f32>,
+    vel_out: Buffer<f32>,
     aabb_min_buf: Buffer<f32>,
     aabb_max_buf: Buffer<f32>,
-    overlap_list_buf: Buffer<i32>,
-    overlap_count_buf: Buffer<i32>,
+    overlap_bits_buf: Buffer<u32>,
+    degree_buf: Buffer<u32>,
     n: usize,
     n_groups: usize,
-    w: usize,
-    collision_kernel: ocl::Kernel,
+    n_words: usize,
+    collision_normal_kernel: ocl::Kernel,
+    collision_pathological_kernel: ocl::Kernel,
     aabb_kernel: ocl::Kernel,
-    overlap_kernel: ocl::Kernel,
+    overlap_bits_kernel: ocl::Kernel,
+    overlap_degrees_kernel: ocl::Kernel,
 }
 
 impl CollisionOcl {
     fn new(n: usize, w: usize, box_min: [f32; 3], box_max: [f32; 3], radius: f32) -> ocl::Result<Self> {
+        assert_eq!(w, GROUP_SIZE, "demo10 requires W=32");
+        assert!(n > 0 && n % GROUP_SIZE == 0, "particle count must be a positive multiple of 32");
         let mut rng = rand::thread_rng();
-        let n_groups = (n + w - 1) / w;
+        let n_groups = n / GROUP_SIZE;
+        let n_words = (n_groups + 31) / 32;
 
         // Initialize particles randomly in the box, 2D (y=0)
         let pos_host: Vec<f32> = (0..n).flat_map(|_| {
@@ -111,19 +171,24 @@ impl CollisionOcl {
             .dims(n)
             .build()?;
 
-        let pos_buf = Buffer::builder()
+        let pos_in = Buffer::builder()
             .queue(pro_que.queue().clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
             .len(n * 4)
             .copy_host_slice(&pos_host)
             .build()?;
-        let vel_buf = Buffer::builder()
+        let vel_in = Buffer::builder()
             .queue(pro_que.queue().clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
             .len(n * 4)
             .copy_host_slice(&vel_host)
             .build()?;
-        let force_buf = Buffer::builder()
+        let pos_out = Buffer::builder()
+            .queue(pro_que.queue().clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(n * 4)
+            .build()?;
+        let vel_out = Buffer::builder()
             .queue(pro_que.queue().clone())
             .flags(flags::MEM_READ_WRITE)
             .len(n * 4)
@@ -138,29 +203,28 @@ impl CollisionOcl {
             .flags(flags::MEM_READ_WRITE)
             .len(n_groups * 4)
             .build()?;
-        let overlap_list_buf = Buffer::builder()
+        let overlap_bits_buf = Buffer::<u32>::builder()
             .queue(pro_que.queue().clone())
             .flags(flags::MEM_READ_WRITE)
-            .len(n_groups * MAX_OVERLAP)
+            .len(n_groups * n_words)
             .build()?;
-        let overlap_count_buf = Buffer::builder()
+        let degree_buf = Buffer::<u32>::builder()
             .queue(pro_que.queue().clone())
             .flags(flags::MEM_READ_WRITE)
             .len(n_groups)
             .build()?;
-
-        let n_padded = n_groups * w; // global size must be multiple of local size
-        let collision_kernel = pro_que.kernel_builder("collision_step")
+        let n_padded = n_groups * GROUP_SIZE;
+        let collision_normal_kernel = pro_que.kernel_builder("collision_step_normal")
             .global_work_size(n_padded)
-            .local_work_size(w)
-            .arg(&pos_buf)
-            .arg(&vel_buf)
-            .arg(&force_buf)
-            .arg(&overlap_list_buf)
-            .arg(&overlap_count_buf)
-            .arg(n as i32)
+            .local_work_size(GROUP_SIZE)
+            .arg(&pos_in)
+            .arg(&vel_in)
+            .arg(&pos_out)
+            .arg(&vel_out)
+            .arg(&overlap_bits_buf)
+            .arg(&degree_buf)
             .arg(n_groups as i32)
-            .arg(MAX_OVERLAP as i32)
+            .arg(PATHOLOGICAL_DEGREE as u32)
             .arg(0.005f32)                              // dt
             .arg(Float4::new(0.0, 0.0, 9.81, 0.0))      // gravity (down = +z in xz view)
             .arg(0.5f32)                                 // restitution
@@ -171,73 +235,118 @@ impl CollisionOcl {
             .arg(0.999f32)                               // vel_damping
             .arg(1i32)                                   // constrain_2d
             .build()?;
+        let collision_pathological_kernel = pro_que.kernel_builder("collision_step_pathological")
+            .global_work_size(n_padded)
+            .local_work_size(GROUP_SIZE)
+            .arg(&pos_in)
+            .arg(&vel_in)
+            .arg(&pos_out)
+            .arg(&vel_out)
+            .arg(&overlap_bits_buf)
+            .arg(&degree_buf)
+            .arg(n_groups as i32)
+            .arg(PATHOLOGICAL_DEGREE as u32)
+            .arg(0.005f32)
+            .arg(Float4::new(0.0, 0.0, 9.81, 0.0))
+            .arg(0.5f32)
+            .arg(Float4::new(box_min[0], box_min[1], box_min[2], 0.0))
+            .arg(Float4::new(box_max[0], box_max[1], box_max[2], 0.0))
+            .arg(1000.0f32)
+            .arg(10.0f32)
+            .arg(0.999f32)
+            .arg(1i32)
+            .build()?;
 
         // AABB kernel: launch n_groups workgroups of size w
         let aabb_kernel = pro_que.kernel_builder("compute_aabbs")
             .global_work_size(n_groups * w)
-            .local_work_size(w)
-            .arg(&pos_buf)
+            .local_work_size(GROUP_SIZE)
+            .arg(&pos_in)
             .arg(&aabb_min_buf)
             .arg(&aabb_max_buf)
             .arg(n as i32)
             .build()?;
 
-        // Overlap kernel: launch n_groups workgroups of size w
-        let overlap_kernel = pro_que.kernel_builder("compute_overlaps")
-            .global_work_size(n_groups * w)
-            .local_work_size(w)
+        let overlap_bits_kernel = pro_que.kernel_builder("compute_overlap_bits")
+            .global_work_size(n_groups * n_words)
             .arg(&aabb_min_buf)
             .arg(&aabb_max_buf)
-            .arg(&overlap_list_buf)
-            .arg(&overlap_count_buf)
+            .arg(&overlap_bits_buf)
             .arg(n_groups as i32)
+            .arg(n_words as i32)
+            .build()?;
+        let overlap_degrees_kernel = pro_que.kernel_builder("compute_overlap_degrees")
+            .global_work_size(n_groups)
+            .arg(&overlap_bits_buf)
+            .arg(&degree_buf)
+            .arg(n_groups as i32)
+            .arg(n_words as i32)
             .build()?;
 
-        Ok(Self { pro_que, pos_buf, vel_buf, force_buf, aabb_min_buf, aabb_max_buf, overlap_list_buf, overlap_count_buf, n, n_groups, w, collision_kernel, aabb_kernel, overlap_kernel })
+        Ok(Self { pro_que, pos_in, vel_in, pos_out, vel_out, aabb_min_buf, aabb_max_buf, overlap_bits_buf, degree_buf, n, n_groups, n_words, collision_normal_kernel, collision_pathological_kernel, aabb_kernel, overlap_bits_kernel, overlap_degrees_kernel })
     }
 
     fn step(&mut self, dt: f32, gravity: [f32; 3], restitution: f32, k_spring: f32, k_damp: f32, vel_damping: f32, constrain_2d: bool) -> ocl::Result<()> {
         // Caller must compute_aabbs() and compute_overlaps() before calling this.
-        self.collision_kernel.set_arg(8, dt)?;
-        self.collision_kernel.set_arg(9, Float4::new(gravity[0], gravity[1], gravity[2], 0.0))?;
-        self.collision_kernel.set_arg(10, restitution)?;
-        self.collision_kernel.set_arg(13, k_spring)?;
-        self.collision_kernel.set_arg(14, k_damp)?;
-        self.collision_kernel.set_arg(15, vel_damping)?;
-        self.collision_kernel.set_arg(16, if constrain_2d { 1i32 } else { 0i32 })?;
-        unsafe { self.collision_kernel.enq()?; }
+        let gravity = Float4::new(gravity[0], gravity[1], gravity[2], 0.0);
+        for kernel in [&mut self.collision_normal_kernel, &mut self.collision_pathological_kernel] {
+            kernel.set_arg(0, &self.pos_in)?;
+            kernel.set_arg(1, &self.vel_in)?;
+            kernel.set_arg(2, &self.pos_out)?;
+            kernel.set_arg(3, &self.vel_out)?;
+            kernel.set_arg(8, dt)?;
+            kernel.set_arg(9, gravity)?;
+            kernel.set_arg(10, restitution)?;
+            kernel.set_arg(13, k_spring)?;
+            kernel.set_arg(14, k_damp)?;
+            kernel.set_arg(15, vel_damping)?;
+            kernel.set_arg(16, if constrain_2d { 1i32 } else { 0i32 })?;
+        }
+        unsafe {
+            self.collision_normal_kernel.enq()?;
+            self.collision_pathological_kernel.enq()?;
+        }
+        std::mem::swap(&mut self.pos_in, &mut self.pos_out);
+        std::mem::swap(&mut self.vel_in, &mut self.vel_out);
         Ok(())
     }
 
-    fn compute_aabbs(&self) -> ocl::Result<()> {
+    fn compute_aabbs(&mut self) -> ocl::Result<()> {
+        self.aabb_kernel.set_arg(0, &self.pos_in)?;
         unsafe { self.aabb_kernel.enq()?; }
         Ok(())
     }
 
     fn compute_overlaps(&self) -> ocl::Result<()> {
-        unsafe { self.overlap_kernel.enq()?; }
+        unsafe {
+            self.overlap_bits_kernel.enq()?;
+            self.overlap_degrees_kernel.enq()?;
+        }
         Ok(())
     }
 
     fn read_positions(&self) -> Vec<[f32; 4]> {
         let mut buf = vec![0.0f32; self.n * 4];
-        self.pos_buf.read(&mut buf).enq().expect("read pos_buf failed");
+        self.pos_in.read(&mut buf).enq().expect("read pos_in failed");
         (0..self.n).map(|i| [buf[i*4], buf[i*4+1], buf[i*4+2], buf[i*4+3]]).collect()
     }
 
     fn read_velocities(&self) -> Vec<[f32; 4]> {
         let mut buf = vec![0.0f32; self.n * 4];
-        self.vel_buf.read(&mut buf).enq().expect("read vel_buf failed");
+        self.vel_in.read(&mut buf).enq().expect("read vel_in failed");
         (0..self.n).map(|i| [buf[i*4], buf[i*4+1], buf[i*4+2], buf[i*4+3]]).collect()
     }
 
     fn write_pos_vel(&self, pos: &[f32], vel: &[f32]) {
-        self.pos_buf.write(pos).enq().expect("write pos_buf failed");
-        self.vel_buf.write(vel).enq().expect("write vel_buf failed");
+        assert_eq!(pos.len(), self.n * 4);
+        assert_eq!(vel.len(), self.n * 4);
+        self.pos_in.write(pos).enq().expect("write pos_in failed");
+        self.vel_in.write(vel).enq().expect("write vel_in failed");
     }
 
     fn write_vel(&self, vel: &[f32]) {
-        self.vel_buf.write(vel).enq().expect("write vel_buf failed");
+        assert_eq!(vel.len(), self.n * 4);
+        self.vel_in.write(vel).enq().expect("write vel_in failed");
     }
 
     fn read_aabbs(&self) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
@@ -250,12 +359,23 @@ impl CollisionOcl {
         (mins, maxs)
     }
 
-    fn read_overlaps(&self) -> (Vec<i32>, Vec<i32>) {
-        let mut list = vec![0i32; self.n_groups * MAX_OVERLAP];
-        let mut count = vec![0i32; self.n_groups];
-        self.overlap_list_buf.read(&mut list).enq().expect("read overlap_list failed");
-        self.overlap_count_buf.read(&mut count).enq().expect("read overlap_count failed");
-        (list, count)
+    fn read_degrees(&self) -> Vec<u32> {
+        let mut degree = vec![0u32; self.n_groups];
+        self.degree_buf.read(&mut degree).enq().expect("read degree failed");
+        degree
+    }
+
+    fn read_overlap_bits(&self) -> Vec<u32> {
+        let mut bits = vec![0u32; self.n_groups * self.n_words];
+        self.overlap_bits_buf.read(&mut bits).enq().expect("read overlap bits failed");
+        bits
+    }
+
+    fn read_group_map(&self) -> GroupMap {
+        let (amins, amaxs) = self.read_aabbs();
+        let map = GroupMap { amins, amaxs, bits: self.read_overlap_bits(), degree: self.read_degrees(), n_words: self.n_words };
+        map.validate();
+        map
     }
 }
 
@@ -277,7 +397,8 @@ fn aabb_surface_2d(mn: &[f32;4], mx: &[f32;4]) -> f32 {
 /// O(G^2) CPU overlap count + total surface. Superseded by GPU overlap kernel
 /// for overlap counting, but still used for surface computation.
 /// CAVEAT: O(G^2) is fine for 512 groups (131k checks) but doesn't scale.
-/// TODO: Remove this function, use GPU overlap_count + CPU surface sum instead.
+/// TODO: Remove this function, use GPU degrees + CPU surface sum instead.
+#[cfg(test)]
 fn compute_quality(amins: &[[f32; 4]], amaxs: &[[f32; 4]]) -> (usize, f32) {
     let n_groups = amins.len();
     let mut n_overlap = 0;
@@ -312,6 +433,51 @@ fn compute_group_aabbs_host(pos: &[f32], n_groups: usize, w: usize, n: usize) ->
     (amins, amaxs)
 }
 
+fn compute_group_aabb_host(pos: &[f32], g: usize, w: usize) -> ([f32; 4], [f32; 4]) {
+    let mut mn = [1e30f32; 4];
+    let mut mx = [-1e30f32; 4];
+    for i in g*w..(g+1)*w {
+        let x = pos[i*4]; let z = pos[i*4+2]; let r = pos[i*4+3];
+        assert!(x.is_finite() && z.is_finite() && r.is_finite() && r >= 0.0, "invalid particle {i} while computing group {g} AABB");
+        mn[0] = mn[0].min(x - r); mn[2] = mn[2].min(z - r);
+        mx[0] = mx[0].max(x + r); mx[2] = mx[2].max(z + r);
+    }
+    (mn, mx)
+}
+
+fn validate_particle_state(pos: &[f32], vel: &[f32], n: usize) {
+    assert_eq!(pos.len(), n * 4);
+    assert_eq!(vel.len(), n * 4);
+    for i in 0..n {
+        assert!(pos[i*4].is_finite() && pos[i*4+1].is_finite() && pos[i*4+2].is_finite() && pos[i*4+3].is_finite(), "non-finite position record {i}");
+        assert!(vel[i*4].is_finite() && vel[i*4+1].is_finite() && vel[i*4+2].is_finite() && vel[i*4+3].is_finite(), "non-finite velocity record {i}");
+        assert!(pos[i*4+3] >= 0.0, "negative radius for particle {i}");
+        assert!(vel[i*4+3] >= 0.0, "negative inverse mass for particle {i}");
+    }
+}
+
+fn ranked_overlap_pairs(map: &GroupMap) -> Vec<(usize, usize)> {
+    let n_groups = map.degree.len();
+    let mut pairs: Vec<(u32, u32, f32, usize, usize)> = Vec::new();
+    for g in 0..n_groups {
+        for word in 0..map.n_words {
+            let mut mask = map.bits[g * map.n_words + word];
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                let h = word * 32 + bit;
+                if h > g {
+                    let ox = (map.amaxs[g][0].min(map.amaxs[h][0]) - map.amins[g][0].max(map.amins[h][0])).max(0.0);
+                    let oz = (map.amaxs[g][2].min(map.amaxs[h][2]) - map.amins[g][2].max(map.amins[h][2])).max(0.0);
+                    pairs.push((map.degree[g].max(map.degree[h]), map.degree[g] + map.degree[h], ox * oz, g, h));
+                }
+                mask &= mask - 1;
+            }
+        }
+    }
+    pairs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| b.2.total_cmp(&a.2)).then_with(|| a.3.cmp(&b.3)).then_with(|| a.4.cmp(&b.4)));
+    pairs.into_iter().map(|(_, _, _, g, h)| (g, h)).collect()
+}
+
 /// Greedy pairwise swap rebalancing.
 ///
 /// For each group, find the particle that most extends its AABB (farthest from
@@ -321,12 +487,14 @@ fn compute_group_aabbs_host(pos: &[f32], n_groups: usize, w: usize, n: usize) ->
 ///
 /// CAVEAT: Greedy one-at-a-time swaps can miss cooperative improvements where
 /// two particles need to exchange simultaneously for any gain. The balanced
-/// merge-split approach (planned) handles this better.
-/// CAVEAT: Recomputes ALL group AABBs after each swap attempt (O(N) per swap).
-/// Could be optimized to recompute only the two affected groups.
+/// merge-split approach handles this better. Candidate destination groups come
+/// from the GPU overlap row; accepted swaps recompute only two group AABBs.
 /// TODO: Replace with unified merge-split that inspects k particles crossing.
-fn rebalance_swaps(pos: &mut Vec<f32>, vel: &mut Vec<f32>, n_groups: usize, w: usize, n: usize, max_swaps: usize) -> usize {
-    let (amins, amaxs) = compute_group_aabbs_host(pos, n_groups, w, n);
+fn rebalance_swaps(pos: &mut Vec<f32>, vel: &mut Vec<f32>, map: &GroupMap, w: usize, n: usize, max_swaps: usize) -> usize {
+    let n_groups = map.degree.len();
+    assert_eq!(n_groups * w, n);
+    validate_particle_state(pos, vel, n);
+    let (mut amins, mut amaxs) = compute_group_aabbs_host(pos, n_groups, w, n);
     let mut centers = vec![[0.0f32; 2]; n_groups];
     for g in 0..n_groups {
         centers[g] = [(amins[g][0] + amaxs[g][0]) * 0.5, (amins[g][2] + amaxs[g][2]) * 0.5];
@@ -338,35 +506,38 @@ fn rebalance_swaps(pos: &mut Vec<f32>, vel: &mut Vec<f32>, n_groups: usize, w: u
         let lo = g * w;
         let hi = ((g + 1) * w).min(n);
         for i in lo..hi {
-            let x = pos[i*4]; let z = pos[i*4+2]; let r = pos[i*4+3];
+            let x = pos[i*4]; let z = pos[i*4+2];
             // Distance from center, plus how much this particle extends the box
-            let dx = (x - centers[g][0]).max(0.0);
-            let dz = (z - centers[g][1]).max(0.0);
-            let extend = (x + r - amaxs[g][0]).max(0.0).max((amins[g][0] - (x - r)).max(0.0))
-                       + (z + r - amaxs[g][2]).max(0.0).max((amins[g][2] - (z - r)).max(0.0));
-            let score = dx*dx + dz*dz + extend * extend * 4.0; // weighted
+            let dx = x - centers[g][0];
+            let dz = z - centers[g][1];
+            let score = dx*dx + dz*dz;
             worst.push((score, i, g));
         }
     }
-    worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
 
     let mut n_swapped = 0;
-    let mut used = std::collections::HashSet::new();
+    let mut used_groups = vec![false; n_groups];
     for &(_, i, g) in &worst {
         if n_swapped >= max_swaps { break; }
-        if used.contains(&i) { continue; }
+        if used_groups[g] { continue; }
         let x = pos[i*4]; let z = pos[i*4+2];
 
         // Find which other group's AABB contains this particle
         let mut best_target = None;
         let mut best_dist = f32::MAX;
-        for h in 0..n_groups {
-            if h == g { continue; }
-            if x >= amins[h][0] && x <= amaxs[h][0] && z >= amins[h][2] && z <= amaxs[h][2] {
-                let dx = x - centers[h][0];
-                let dz = z - centers[h][1];
-                let d = dx*dx + dz*dz;
-                if d < best_dist { best_dist = d; best_target = Some(h); }
+        for word in 0..map.n_words {
+            let mut mask = map.bits[g * map.n_words + word];
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                let h = word * 32 + bit;
+                if !used_groups[h] && x >= amins[h][0] && x <= amaxs[h][0] && z >= amins[h][2] && z <= amaxs[h][2] {
+                    let dx = x - centers[h][0];
+                    let dz = z - centers[h][1];
+                    let d = dx*dx + dz*dz;
+                    if d < best_dist { best_dist = d; best_target = Some(h); }
+                }
+                mask &= mask - 1;
             }
         }
         let Some(h) = best_target else { continue; };
@@ -377,7 +548,6 @@ fn rebalance_swaps(pos: &mut Vec<f32>, vel: &mut Vec<f32>, n_groups: usize, w: u
         let mut best_j = None;
         let mut best_j_dist = f32::MAX;
         for j in lo_h..hi_h {
-            if used.contains(&j) { continue; }
             let jx = pos[j*4]; let jz = pos[j*4+2];
             let dx = jx - centers[g][0];
             let dz = jz - centers[g][1];
@@ -386,146 +556,128 @@ fn rebalance_swaps(pos: &mut Vec<f32>, vel: &mut Vec<f32>, n_groups: usize, w: u
         }
         let Some(j) = best_j else { continue; };
 
-        // Evaluate: swap i and j, recompute both group AABBs, check if total surface decreases
-        let surf_before = aabb_surface_2d(&amins[g], &amaxs[g]) + aabb_surface_2d(&amins[h], &amaxs[h]);
+        // Evaluate incident overlap count first, then total pair perimeter.
+        let cost_before = pair_cost(g, h, &amins[g], &amaxs[g], &amins[h], &amaxs[h], &amins, &amaxs);
 
-        // Temporarily swap
-        for k in 0..4 {
-            pos[i*4+k] = pos[i*4+k] + pos[j*4+k];
-            pos[j*4+k] = pos[i*4+k] - pos[j*4+k];
-            pos[i*4+k] = pos[i*4+k] - pos[j*4+k];
-        }
-        for k in 0..4 {
-            vel[i*4+k] = vel[i*4+k] + vel[j*4+k];
-            vel[j*4+k] = vel[i*4+k] - vel[j*4+k];
-            vel[i*4+k] = vel[i*4+k] - vel[j*4+k];
-        }
+        // Temporarily swap using ordinary temporaries; arithmetic float swaps
+        // lose precision and can turn finite state into NaN/Inf.
+        let old_pos_i = [pos[i*4], pos[i*4+1], pos[i*4+2], pos[i*4+3]];
+        let old_vel_i = [vel[i*4], vel[i*4+1], vel[i*4+2], vel[i*4+3]];
+        let old_pos_j = [pos[j*4], pos[j*4+1], pos[j*4+2], pos[j*4+3]];
+        let old_vel_j = [vel[j*4], vel[j*4+1], vel[j*4+2], vel[j*4+3]];
+        pos[i*4..i*4+4].copy_from_slice(&old_pos_j);
+        vel[i*4..i*4+4].copy_from_slice(&old_vel_j);
+        pos[j*4..j*4+4].copy_from_slice(&old_pos_i);
+        vel[j*4..j*4+4].copy_from_slice(&old_vel_i);
 
-        let (new_amins, new_amaxs) = compute_group_aabbs_host(pos, n_groups, w, n);
-        let surf_after = aabb_surface_2d(&new_amins[g], &new_amaxs[g]) + aabb_surface_2d(&new_amins[h], &new_amaxs[h]);
+        let (new_g_min, new_g_max) = compute_group_aabb_host(pos, g, w);
+        let (new_h_min, new_h_max) = compute_group_aabb_host(pos, h, w);
+        let cost_after = pair_cost(g, h, &new_g_min, &new_g_max, &new_h_min, &new_h_max, &amins, &amaxs);
 
-        if surf_after < surf_before {
+        if cost_better(cost_after, cost_before) {
             // Accept swap
-            used.insert(i);
-            used.insert(j);
+            amins[g] = new_g_min; amaxs[g] = new_g_max;
+            amins[h] = new_h_min; amaxs[h] = new_h_max;
+            centers[g] = [(amins[g][0] + amaxs[g][0]) * 0.5, (amins[g][2] + amaxs[g][2]) * 0.5];
+            centers[h] = [(amins[h][0] + amaxs[h][0]) * 0.5, (amins[h][2] + amaxs[h][2]) * 0.5];
+            used_groups[g] = true;
+            used_groups[h] = true;
             n_swapped += 1;
         } else {
             // Revert swap
-            for k in 0..4 {
-                pos[i*4+k] = pos[i*4+k] + pos[j*4+k];
-                pos[j*4+k] = pos[i*4+k] - pos[j*4+k];
-                pos[i*4+k] = pos[i*4+k] - pos[j*4+k];
-            }
-            for k in 0..4 {
-                vel[i*4+k] = vel[i*4+k] + vel[j*4+k];
-                vel[j*4+k] = vel[i*4+k] - vel[j*4+k];
-                vel[i*4+k] = vel[i*4+k] - vel[j*4+k];
-            }
+            pos[i*4..i*4+4].copy_from_slice(&old_pos_i);
+            vel[i*4..i*4+4].copy_from_slice(&old_vel_i);
+            pos[j*4..j*4+4].copy_from_slice(&old_pos_j);
+            vel[j*4..j*4+4].copy_from_slice(&old_vel_j);
         }
     }
     n_swapped
 }
 
-/// 2W->W+W retiling: merge two overlapping groups, sort by longest axis, split at median.
+/// 2W->W+W retiling: merge two overlapping groups, split along their center line.
 ///
 /// For each overlapping pair (sorted by overlap area), merge all 2W particles,
-/// find the longest axis of the combined bounding box, sort by that axis,
-/// and split at the median. Accept if total AABB surface decreases.
+/// project them onto the line between group centers, and split at the median.
+/// Accept if total AABB surface decreases.
 ///
-/// CAVEAT: Sorting by the longest single axis (x or z) is suboptimal when
-/// groups are offset diagonally. The optimal balanced partition for fixed
-/// centers sorts by projection onto the line connecting group centers:
-///   Delta_i = |x_i - c_A|^2 - |x_i - c_B|^2
-/// This is equivalent to sorting by dot(x_i, c_B - c_A), which picks the
-/// cut plane perpendicular to the inter-center direction.
-/// TODO: Replace axis-based sort with Delta_i projection + center iteration.
-fn rebalance_retile(pos: &mut Vec<f32>, vel: &mut Vec<f32>, n_groups: usize, w: usize, n: usize, max_pairs: usize) -> usize {
-    let (amins, amaxs) = compute_group_aabbs_host(pos, n_groups, w, n);
-
-    // Find overlapping pairs, sorted by overlap volume (descending)
-    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
-    for g in 0..n_groups {
-        for h in (g+1)..n_groups {
-            if aabb_overlap(&amins[g], &amaxs[g], &amins[h], &amaxs[h]) {
-                let ox = (amaxs[g][0].min(amaxs[h][0]) - amins[g][0].max(amins[h][0])).max(0.0);
-                let oz = (amaxs[g][2].min(amaxs[h][2]) - amins[g][2].max(amins[h][2])).max(0.0);
-                pairs.push((ox * oz, g, h)); // overlap area
-            }
-        }
+/// The candidate set tests x, z, and the center-to-center direction. Acceptance
+/// first minimizes incident overlaps and then total AABB perimeter.
+fn ordered_aabb(pos: &[f32], order: &[usize]) -> ([f32; 4], [f32; 4]) {
+    let mut mn = [1e30f32; 4];
+    let mut mx = [-1e30f32; 4];
+    for &i in order {
+        let x = pos[i*4]; let z = pos[i*4+2]; let r = pos[i*4+3];
+        mn[0] = mn[0].min(x-r); mn[2] = mn[2].min(z-r);
+        mx[0] = mx[0].max(x+r); mx[2] = mx[2].max(z+r);
     }
-    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    (mn, mx)
+}
 
+fn pair_cost(g: usize, h: usize, gmin: &[f32; 4], gmax: &[f32; 4], hmin: &[f32; 4], hmax: &[f32; 4], amins: &[[f32; 4]], amaxs: &[[f32; 4]]) -> (usize, f32) {
+    let mut overlaps = usize::from(aabb_overlap(gmin, gmax, hmin, hmax));
+    for k in 0..amins.len() {
+        if k == g || k == h { continue; }
+        overlaps += usize::from(aabb_overlap(gmin, gmax, &amins[k], &amaxs[k]));
+        overlaps += usize::from(aabb_overlap(hmin, hmax, &amins[k], &amaxs[k]));
+    }
+    (overlaps, aabb_surface_2d(gmin, gmax) + aabb_surface_2d(hmin, hmax))
+}
+
+fn cost_better(a: (usize, f32), b: (usize, f32)) -> bool {
+    a.0 < b.0 || (a.0 == b.0 && a.1 < b.1 - 1e-6)
+}
+
+fn rebalance_retile(pos: &mut Vec<f32>, vel: &mut Vec<f32>, map: &GroupMap, w: usize, n: usize, max_pairs: usize) -> usize {
+    let n_groups = map.degree.len();
+    assert_eq!(n_groups * w, n);
+    validate_particle_state(pos, vel, n);
+    let pairs = ranked_overlap_pairs(map);
+    let (mut amins, mut amaxs) = compute_group_aabbs_host(pos, n_groups, w, n);
+    let mut used_groups = vec![false; n_groups];
     let mut n_retiled = 0;
-    let mut used_groups = std::collections::HashSet::new();
-    for &(_, g, h) in &pairs {
+
+    for &(g, h) in &pairs {
         if n_retiled >= max_pairs { break; }
-        if used_groups.contains(&g) || used_groups.contains(&h) { continue; }
+        if used_groups[g] || used_groups[h] { continue; }
+        let lo_g = g*w; let lo_h = h*w;
+        let mut merged_pos = Vec::with_capacity(2*w*4);
+        let mut merged_vel = Vec::with_capacity(2*w*4);
+        merged_pos.extend_from_slice(&pos[lo_g*4..(lo_g+w)*4]);
+        merged_pos.extend_from_slice(&pos[lo_h*4..(lo_h+w)*4]);
+        merged_vel.extend_from_slice(&vel[lo_g*4..(lo_g+w)*4]);
+        merged_vel.extend_from_slice(&vel[lo_h*4..(lo_h+w)*4]);
 
-        let lo_g = g * w;
-        let hi_g = ((g + 1) * w).min(n);
-        let lo_h = h * w;
-        let hi_h = ((h + 1) * w).min(n);
-        let n_g = hi_g - lo_g;
-        let n_h = hi_h - lo_h;
-        if n_g + n_h == 0 { continue; }
-
-        // Merge particles from g and h
-        let mut merged_pos: Vec<f32> = Vec::with_capacity((n_g + n_h) * 4);
-        let mut merged_vel: Vec<f32> = Vec::with_capacity((n_g + n_h) * 4);
-        let mut orig_indices: Vec<usize> = Vec::with_capacity(n_g + n_h);
-        for &lo in &[lo_g, lo_h] {
-            let hi = if lo == lo_g { hi_g } else { hi_h };
-            for i in lo..hi {
-                merged_pos.extend_from_slice(&pos[i*4..i*4+4]);
-                merged_vel.extend_from_slice(&vel[i*4..i*4+4]);
-                orig_indices.push(i);
+        let old_cost = pair_cost(g, h, &amins[g], &amaxs[g], &amins[h], &amaxs[h], &amins, &amaxs);
+        let dir_x = (amaxs[h][0] + amins[h][0] - amaxs[g][0] - amins[g][0]) * 0.5;
+        let dir_z = (amaxs[h][2] + amins[h][2] - amaxs[g][2] - amins[g][2]) * 0.5;
+        let mut best_cost = old_cost;
+        let mut best: Option<(Vec<usize>, [f32; 4], [f32; 4], [f32; 4], [f32; 4])> = None;
+        for &(dx, dz) in &[(1.0f32, 0.0f32), (0.0, 1.0), (dir_x, dir_z)] {
+            if dx*dx + dz*dz <= 1e-20 { continue; }
+            let mut order: Vec<usize> = (0..2*w).collect();
+            order.sort_by(|&a, &b| {
+                let sa = merged_pos[a*4]*dx + merged_pos[a*4+2]*dz;
+                let sb = merged_pos[b*4]*dx + merged_pos[b*4+2]*dz;
+                sa.total_cmp(&sb).then_with(|| a.cmp(&b))
+            });
+            let (gmin, gmax) = ordered_aabb(&merged_pos, &order[..w]);
+            let (hmin, hmax) = ordered_aabb(&merged_pos, &order[w..]);
+            let candidate_cost = pair_cost(g, h, &gmin, &gmax, &hmin, &hmax, &amins, &amaxs);
+            if cost_better(candidate_cost, best_cost) {
+                best_cost = candidate_cost;
+                best = Some((order, gmin, gmax, hmin, hmax));
             }
         }
-        let n_merged = orig_indices.len();
+        let Some((order, gmin, gmax, hmin, hmax)) = best else { continue; };
 
-        // Find longest axis of combined bounding box
-        let combined_min_x = merged_pos.iter().step_by(4).cloned().fold(f32::MAX, f32::min);
-        let combined_max_x = merged_pos.iter().step_by(4).cloned().fold(f32::MIN, f32::max);
-        let combined_min_z = merged_pos.iter().skip(2).step_by(4).cloned().fold(f32::MAX, f32::min);
-        let combined_max_z = merged_pos.iter().skip(2).step_by(4).cloned().fold(f32::MIN, f32::max);
-        let dx = combined_max_x - combined_min_x;
-        let dz = combined_max_z - combined_min_z;
-        let axis = if dx > dz { 0 } else { 2 }; // 0=x, 2=z
-
-        // Sort merged by axis coordinate
-        let mut sort_idx: Vec<usize> = (0..n_merged).collect();
-        sort_idx.sort_by(|&a, &b| {
-            merged_pos[a*4+axis].partial_cmp(&merged_pos[b*4+axis]).unwrap()
-        });
-
-        // Compute surface before
-        let surf_before = aabb_surface_2d(&amins[g], &amaxs[g]) + aabb_surface_2d(&amins[h], &amaxs[h]);
-
-        // Split at median: first half -> g, second half -> h
-        let mid = n_merged / 2;
-        let new_pos = merged_pos.clone();
-        let new_vel = merged_vel.clone();
-        for (k, &si) in sort_idx.iter().enumerate() {
-            let target = if k < mid { lo_g + k } else { lo_h + (k - mid) };
-            pos[target*4..target*4+4].copy_from_slice(&new_pos[si*4..si*4+4]);
-            vel[target*4..target*4+4].copy_from_slice(&new_vel[si*4..si*4+4]);
+        for (k, &src) in order.iter().enumerate() {
+            let target = if k < w { lo_g + k } else { lo_h + k - w };
+            pos[target*4..target*4+4].copy_from_slice(&merged_pos[src*4..src*4+4]);
+            vel[target*4..target*4+4].copy_from_slice(&merged_vel[src*4..src*4+4]);
         }
-
-        // Compute surface after
-        let (new_amins, new_amaxs) = compute_group_aabbs_host(pos, n_groups, w, n);
-        let surf_after = aabb_surface_2d(&new_amins[g], &new_amaxs[g]) + aabb_surface_2d(&new_amins[h], &new_amaxs[h]);
-
-        if surf_after < surf_before {
-            used_groups.insert(g);
-            used_groups.insert(h);
-            n_retiled += 1;
-        } else {
-            // Revert: put original data back
-            for (k, &oi) in orig_indices.iter().enumerate() {
-                pos[oi*4..oi*4+4].copy_from_slice(&merged_pos[k*4..k*4+4]);
-                vel[oi*4..oi*4+4].copy_from_slice(&merged_vel[k*4..k*4+4]);
-            }
-        }
+        amins[g] = gmin; amaxs[g] = gmax; amins[h] = hmin; amaxs[h] = hmax;
+        used_groups[g] = true; used_groups[h] = true;
+        n_retiled += 1;
     }
     n_retiled
 }
@@ -560,9 +712,9 @@ fn color_group(g: usize) -> egui::Color32 {
 /// metrics, and mouse interaction state. The update() loop runs physics,
 /// reads back data, and renders to the egui central panel.
 ///
-/// Non-obvious: pos_read is read at the START of the frame (for mouse picking)
-/// and again after physics step (for rendering). When dragging (picked.is_some()),
-/// the second read is skipped to avoid overwriting the dragged position.
+/// pos_read is the previous rendered snapshot used for mouse picking. It is
+/// refreshed once after physics; while dragging, only the selected entry is
+/// updated so the dragged particle remains visually attached to the cursor.
 struct CollisionApp {
     sim: CollisionOcl,
     dt: f32,
@@ -587,10 +739,14 @@ struct CollisionApp {
     dots_only: bool,
     paused: bool,
     auto_rebuild: bool,
+    rebalance_strategy: RebalanceStrategy,
     rebuild_interval: usize,
+    rebuild_degree_trigger: usize,
+    max_rebalance_ops: usize,
+    ms_rebalance: f32,
     frame_count: usize,
     n_overlap: usize,           // total unique overlap pairs (from GPU)
-    n_overflow: usize,           // groups whose overlap count > MAX_OVERLAP
+    n_overflow: usize,           // groups whose exact degree exceeds the fast-path threshold
     max_overlap: usize,          // max overlaps any single group has
     total_surf: f32,
     last_swaps: usize,
@@ -609,6 +765,7 @@ impl CollisionApp {
         let radius = 0.1f32;
         let sim = CollisionOcl::new(n, w, box_min, box_max, radius)
             .expect("Failed to init OpenCL collision sim — is an OpenCL runtime installed?");
+        let pos_read = sim.read_positions();
         Self {
             sim,
             dt: 0.005,
@@ -625,7 +782,7 @@ impl CollisionApp {
             ms_per_step: 0.0,
             ms_broad: 0.0,
             ms_narrow: 0.0,
-            pos_read: vec![[0.0; 4]; n],
+            pos_read,
             aabb_min_read: vec![[0.0; 4]; (n + w - 1) / w],
             aabb_max_read: vec![[0.0; 4]; (n + w - 1) / w],
             show_aabbs: true,
@@ -633,7 +790,11 @@ impl CollisionApp {
             dots_only: true,
             paused: false,
             auto_rebuild: false,
+            rebalance_strategy: RebalanceStrategy::Retile,
             rebuild_interval: 50,
+            rebuild_degree_trigger: 24,
+            max_rebalance_ops: 8,
+            ms_rebalance: 0.0,
             frame_count: 0,
             n_overlap: 0,
             n_overflow: 0,
@@ -651,32 +812,55 @@ impl CollisionApp {
 }
 
 impl CollisionApp {
-    fn do_morton_rebuild(&mut self) {
-        let mut pos: Vec<f32> = self.sim.read_positions().into_iter().flat_map(|p| p.into_iter()).collect();
-        let mut vel: Vec<f32> = self.sim.read_velocities().into_iter().flat_map(|v| v.into_iter()).collect();
-        sort_by_morton(&mut pos, &mut vel, &self.box_min, &self.box_max);
-        self.sim.write_pos_vel(&pos, &vel);
-        println!("Morton rebuild done");
+    fn refresh_group_map(&mut self) -> GroupMap {
+        self.sim.compute_aabbs().expect("AABB kernel failed before rebalancing");
+        self.sim.compute_overlaps().expect("overlap kernels failed before rebalancing");
+        self.sim.pro_que.queue().finish().expect("queue failed before rebalancing");
+        self.sim.read_group_map()
     }
 
-    fn do_greedy_swaps(&mut self) {
+    fn apply_rebalance(&mut self, strategy: RebalanceStrategy, map: &GroupMap) -> bool {
+        let t0 = Instant::now();
         let mut pos: Vec<f32> = self.sim.read_positions().into_iter().flat_map(|p| p.into_iter()).collect();
         let mut vel: Vec<f32> = self.sim.read_velocities().into_iter().flat_map(|v| v.into_iter()).collect();
-        let n_swapped = rebalance_swaps(&mut pos, &mut vel, self.sim.n_groups, self.w, self.n, 16);
-        if n_swapped > 0 {
+        validate_particle_state(&pos, &vel, self.n);
+        self.last_swaps = 0;
+        self.last_retiles = 0;
+        let changed = match strategy {
+            RebalanceStrategy::GreedySwaps => {
+                self.last_swaps = rebalance_swaps(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+                self.last_swaps > 0
+            }
+            RebalanceStrategy::Retile => {
+                self.last_retiles = rebalance_retile(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+                self.last_retiles > 0
+            }
+            RebalanceStrategy::SwapsThenRetile => {
+                self.last_swaps = rebalance_swaps(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+                self.last_retiles = rebalance_retile(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+                self.last_swaps > 0 || self.last_retiles > 0
+            }
+            RebalanceStrategy::Morton => {
+                sort_by_morton(&mut pos, &mut vel, &self.box_min, &self.box_max);
+                true
+            }
+        };
+        validate_particle_state(&pos, &vel, self.n);
+        if changed {
             self.sim.write_pos_vel(&pos, &vel);
+            self.sim.pro_que.queue().finish().expect("rebalanced state upload failed");
         }
-        self.last_swaps = n_swapped;
+        self.ms_rebalance = t0.elapsed().as_secs_f32() * 1000.0;
+        changed
     }
 
-    fn do_retile(&mut self) {
-        let mut pos: Vec<f32> = self.sim.read_positions().into_iter().flat_map(|p| p.into_iter()).collect();
-        let mut vel: Vec<f32> = self.sim.read_velocities().into_iter().flat_map(|v| v.into_iter()).collect();
-        let n_retiled = rebalance_retile(&mut pos, &mut vel, self.sim.n_groups, self.w, self.n, 8);
-        if n_retiled > 0 {
-            self.sim.write_pos_vel(&pos, &vel);
+    fn manual_rebalance(&mut self, strategy: RebalanceStrategy) {
+        let map = self.refresh_group_map();
+        if self.apply_rebalance(strategy, &map) {
+            self.sim.compute_aabbs().expect("AABB rebuild failed after manual rebalancing");
+            self.sim.compute_overlaps().expect("overlap rebuild failed after manual rebalancing");
+            self.sim.pro_que.queue().finish().expect("queue failed after manual rebalancing");
         }
-        self.last_retiles = n_retiled;
     }
 }
 
@@ -704,20 +888,30 @@ impl eframe::App for CollisionApp {
             ui.separator();
             ui.heading("Rebalancing");
             ui.checkbox(&mut self.auto_rebuild, "Auto rebuild");
+            egui::ComboBox::from_label("Strategy")
+                .selected_text(self.rebalance_strategy.label())
+                .show_ui(ui, |ui| {
+                    for strategy in [RebalanceStrategy::Retile, RebalanceStrategy::GreedySwaps, RebalanceStrategy::SwapsThenRetile, RebalanceStrategy::Morton] {
+                        ui.selectable_value(&mut self.rebalance_strategy, strategy, strategy.label());
+                    }
+                });
             ui.add(egui::Slider::new(&mut self.rebuild_interval, 10..=200).text("interval (frames)"));
+            ui.add(egui::Slider::new(&mut self.rebuild_degree_trigger, 1..=64).text("degree trigger"));
+            ui.add(egui::Slider::new(&mut self.max_rebalance_ops, 1..=32).text("max local repairs"));
             if ui.button("Morton rebuild").clicked() {
-                self.do_morton_rebuild();
+                self.manual_rebalance(RebalanceStrategy::Morton);
             }
             if ui.button("Greedy swaps").clicked() {
-                self.do_greedy_swaps();
+                self.manual_rebalance(RebalanceStrategy::GreedySwaps);
             }
             if ui.button("2W retiling").clicked() {
-                self.do_retile();
+                self.manual_rebalance(RebalanceStrategy::Retile);
             }
             ui.separator();
             ui.label(format!("Overlaps: {} | Max/grp: {}", self.n_overlap, self.max_overlap));
-            ui.label(format!("Overflow groups: {} | Surf: {:.1}", self.n_overflow, self.total_surf));
+            ui.label(format!("Pathological groups: {} | Surf: {:.1}", self.n_overflow, self.total_surf));
             ui.label(format!("Last swaps: {} | retiles: {}", self.last_swaps, self.last_retiles));
+            ui.label(format!("Last rebalance: {:.2} ms", self.ms_rebalance));
             ui.separator();
             ui.label(format!("GPU step: {:.2} ms (broad: {:.2} narrow: {:.2})", self.ms_per_step, self.ms_broad, self.ms_narrow));
         });
@@ -728,9 +922,6 @@ impl eframe::App for CollisionApp {
                 egui::Sense::click_and_drag(),
             );
             let rect = response.rect;
-
-            // Mouse interaction: read positions first (needed for picking)
-            self.pos_read = self.sim.read_positions();
 
             // 2D projection: x -> screen_x, z -> screen_y (top-down xz view)
             let world_w = self.box_max[0] - self.box_min[0];
@@ -817,6 +1008,24 @@ impl eframe::App for CollisionApp {
                 self.sim.pro_que.queue().finish().expect("queue finish failed");
                 self.ms_broad = t_broad.elapsed().as_secs_f32() * 1000.0;
 
+                let auto_due = self.auto_rebuild && (self.frame_count + 1) % self.rebuild_interval == 0;
+                if auto_due {
+                    let map = self.sim.read_group_map();
+                    let max_degree = map.degree.iter().copied().max().unwrap_or(0) as usize;
+                    if max_degree >= self.rebuild_degree_trigger {
+                        let strategy = self.rebalance_strategy;
+                        if self.apply_rebalance(strategy, &map) {
+                            self.sim.compute_aabbs().expect("AABB rebuild failed after rebalancing");
+                            self.sim.compute_overlaps().expect("overlap rebuild failed after rebalancing");
+                            self.sim.pro_que.queue().finish().expect("queue failed after rebalancing");
+                        }
+                    } else {
+                        self.ms_rebalance = 0.0;
+                        self.last_swaps = 0;
+                        self.last_retiles = 0;
+                    }
+                }
+
                 let t_narrow = Instant::now();
                 self.sim.step(self.dt, self.gravity, self.restitution, self.k_spring, self.k_damp, self.vel_damping, self.constrain_2d)
                     .expect("collision kernel enqueue failed");
@@ -824,29 +1033,23 @@ impl eframe::App for CollisionApp {
                 self.ms_narrow = t_narrow.elapsed().as_secs_f32() * 1000.0;
                 self.ms_per_step = self.ms_broad + self.ms_narrow;
                 self.frame_count += 1;
-
-                if self.auto_rebuild && self.frame_count % self.rebuild_interval == 0 {
-                    self.do_greedy_swaps();
-                    self.do_retile();
-                }
             }
 
             // Read back for rendering (positions already read above for picking)
             if !self.picked.is_some() {
                 self.pos_read = self.sim.read_positions();
             }
-            let _ = self.sim.compute_aabbs();
-            let _ = self.sim.compute_overlaps();
             let (amins, amaxs) = self.sim.read_aabbs();
             self.aabb_min_read = amins;
             self.aabb_max_read = amaxs;
 
-            // GPU-computed overlap stats
-            let (_, overlap_counts) = self.sim.read_overlaps();
-            let total_overlaps: i32 = overlap_counts.iter().sum();
-            self.n_overlap = (total_overlaps / 2) as usize; // each pair counted from both sides
-            self.max_overlap = overlap_counts.iter().map(|&c| c as usize).max().unwrap_or(0);
-            self.n_overflow = overlap_counts.iter().filter(|&&c| c as usize > MAX_OVERLAP).count();
+            // GPU-computed overlap stats. The values describe the pre-step
+            // snapshot used by the most recent collision dispatch.
+            let overlap_degrees = self.sim.read_degrees();
+            let total_overlaps: u32 = overlap_degrees.iter().sum();
+            self.n_overlap = (total_overlaps / 2) as usize;
+            self.max_overlap = overlap_degrees.iter().copied().max().unwrap_or(0) as usize;
+            self.n_overflow = overlap_degrees.iter().filter(|&&d| d as usize > PATHOLOGICAL_DEGREE).count();
 
             // Surface (still CPU, cheap: O(G) sum)
             let surf: f32 = (0..self.aabb_min_read.len())
@@ -933,4 +1136,203 @@ fn main() -> eframe::Result {
         eframe::NativeOptions::default(),
         Box::new(|_cc| Ok(Box::new(app))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(Clone, Copy)]
+    struct Box2 { min_x: f32, max_x: f32, min_z: f32, max_z: f32 }
+
+    fn overlaps(a: Box2, b: Box2) -> bool {
+        a.min_x <= b.max_x && a.max_x >= b.min_x &&
+        a.min_z <= b.max_z && a.max_z >= b.min_z
+    }
+
+    fn build_bits(boxes: &[Box2]) -> (Vec<u32>, Vec<u32>) {
+        let n_groups = boxes.len();
+        let n_words = (n_groups + 31) / 32;
+        let mut bits = vec![0u32; n_groups * n_words];
+        let mut degree = vec![0u32; n_groups];
+        for g in 0..n_groups {
+            for h in 0..n_groups {
+                if g == h || !overlaps(boxes[g], boxes[h]) { continue; }
+                bits[g * n_words + h / 32] |= 1u32 << (h % 32);
+                degree[g] += 1;
+            }
+        }
+        (bits, degree)
+    }
+
+    fn make_group_map(pos: &[f32], n_groups: usize) -> super::GroupMap {
+        let (amins, amaxs) = super::compute_group_aabbs_host(pos, n_groups, super::GROUP_SIZE, n_groups * super::GROUP_SIZE);
+        let boxes: Vec<Box2> = (0..n_groups).map(|g| Box2 { min_x: amins[g][0], max_x: amaxs[g][0], min_z: amins[g][2], max_z: amaxs[g][2] }).collect();
+        let (bits, degree) = build_bits(&boxes);
+        let map = super::GroupMap { amins, amaxs, bits, degree, n_words: (n_groups + 31) / 32 };
+        map.validate();
+        map
+    }
+
+    #[test]
+    fn exact_bitset_handles_more_than_32_neighbors() {
+        let boxes = vec![Box2 { min_x: 0.0, max_x: 1.0, min_z: 0.0, max_z: 1.0 }; 40];
+        let (bits, degree) = build_bits(&boxes);
+        assert_eq!(degree[0], 39);
+        assert_eq!(degree[39], 39);
+        assert_eq!(bits.len(), 40 * 2);
+        assert_eq!(bits[0] & 1, 0); // no self bit
+        assert_ne!(bits[0] & (1u32 << 31), 0); // group 31 is retained
+        assert_ne!(bits[0 * 2 + 1] & (1u32 << 7), 0); // group 39 is retained
+    }
+
+    #[test]
+    fn exact_bitset_is_symmetric_and_excludes_non_overlaps() {
+        let boxes = vec![
+            Box2 { min_x: 0.0, max_x: 1.0, min_z: 0.0, max_z: 1.0 },
+            Box2 { min_x: 0.5, max_x: 1.5, min_z: 0.5, max_z: 1.5 },
+            Box2 { min_x: 5.0, max_x: 6.0, min_z: 5.0, max_z: 6.0 },
+        ];
+        let (bits, degree) = build_bits(&boxes);
+        assert_eq!(degree, vec![1, 1, 0]);
+        assert_ne!(bits[0] & (1u32 << 1), 0);
+        assert_ne!(bits[1] & (1u32 << 0), 0);
+        assert_eq!(bits[0] & (1u32 << 2), 0);
+        assert_eq!(bits[2], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "asymmetric overlap edge")]
+    fn group_map_rejects_asymmetric_edges() {
+        let map = super::GroupMap {
+            amins: vec![[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            amaxs: vec![[1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 0.0]],
+            bits: vec![2, 0],
+            degree: vec![1, 0],
+            n_words: 1,
+        };
+        map.validate();
+    }
+
+    #[test]
+    fn retile_uses_gpu_edges_and_preserves_particle_records() {
+        let n = 2 * super::GROUP_SIZE;
+        let mut pos = vec![0.0f32; n*4];
+        let mut vel = vec![0.0f32; n*4];
+        for i in 0..n {
+            let local = i % super::GROUP_SIZE;
+            let x = if i < super::GROUP_SIZE {
+                if local < 16 { -10.0 } else { 10.0 }
+            } else if local < 16 { -9.0 } else { 9.0 };
+            pos[i*4] = x; pos[i*4+2] = 0.0; pos[i*4+3] = 0.1;
+            vel[i*4] = i as f32; vel[i*4+1] = x; vel[i*4+3] = 1.0;
+        }
+        let map = make_group_map(&pos, 2);
+        assert_eq!(map.degree, vec![1, 1]);
+        let quality_before = super::compute_quality(&map.amins, &map.amaxs);
+        let n_retiled = super::rebalance_retile(&mut pos, &mut vel, &map, super::GROUP_SIZE, n, 1);
+        assert_eq!(n_retiled, 1);
+        let (amins, amaxs) = super::compute_group_aabbs_host(&pos, 2, super::GROUP_SIZE, n);
+        let quality_after = super::compute_quality(&amins, &amaxs);
+        assert!(quality_after.0 < quality_before.0 || (quality_after.0 == quality_before.0 && quality_after.1 < quality_before.1));
+        assert!(!super::aabb_overlap(&amins[0], &amaxs[0], &amins[1], &amaxs[1]));
+        let mut ids: Vec<usize> = (0..n).map(|i| vel[i*4] as usize).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..n).collect::<Vec<_>>());
+        for i in 0..n { assert_eq!(pos[i*4], vel[i*4+1], "position/velocity record split at slot {i}"); }
+    }
+
+    #[test]
+    fn opencl_exact_bitset_and_pathological_kernel_smoke() {
+        let n = 40 * super::GROUP_SIZE;
+        let mut sim = super::CollisionOcl::new(
+            n,
+            super::GROUP_SIZE,
+            [-1.0, -1.0, -1.0],
+            [1.0, 1.0, 1.0],
+            0.1,
+        ).expect("OpenCL initialization failed");
+        let pos = vec![[0.0f32, 0.0, 0.0, 0.1]; n].into_iter().flatten().collect::<Vec<_>>();
+        let vel = vec![[0.0f32, 0.0, 0.0, 1.0]; n].into_iter().flatten().collect::<Vec<_>>();
+        sim.write_pos_vel(&pos, &vel);
+        sim.compute_aabbs().expect("AABB kernel failed");
+        sim.compute_overlaps().expect("overlap kernels failed");
+        sim.pro_que.queue().finish().expect("overlap queue failed");
+
+        let degrees = sim.read_degrees();
+        assert!(degrees.iter().all(|&degree| degree == 39));
+        let bits = sim.read_overlap_bits();
+        assert_ne!(bits[39 / 32] & (1u32 << (39 % 32)), 0);
+
+        sim.step(0.001, [0.0, 0.0, 0.0], 0.5, 1000.0, 10.0, 1.0, true)
+            .expect("collision kernels failed");
+        sim.pro_que.queue().finish().expect("collision queue failed");
+        let positions = sim.read_positions();
+        assert!(positions.iter().all(|p| p.iter().all(|x| x.is_finite())));
+    }
+
+    #[test]
+    fn opencl_pathological_row_processes_group_39_and_preserves_input() {
+        let n_groups = 40;
+        let n = n_groups * super::GROUP_SIZE;
+        let mut sim = super::CollisionOcl::new(n, super::GROUP_SIZE, [-20.0, -20.0, -20.0], [20.0, 20.0, 20.0], 0.1).expect("OpenCL initialization failed");
+        let mut pos = vec![0.0f32; n*4];
+        let mut vel = vec![0.0f32; n*4];
+        for i in 0..n {
+            let g = i / super::GROUP_SIZE;
+            pos[i*4] = if g == 0 { 0.0 } else if g == 39 { 0.15 } else { 10.0 };
+            pos[i*4+3] = 0.1;
+            vel[i*4+3] = 1.0;
+        }
+        sim.write_pos_vel(&pos, &vel);
+        let n_words = 2;
+        let mut bits = vec![0u32; n_groups*n_words];
+        let mut degree = vec![0u32; n_groups];
+        for h in 1..n_groups {
+            bits[h/32] |= 1u32 << (h%32);
+            bits[h*n_words] |= 1;
+            degree[0] += 1;
+            degree[h] = 1;
+        }
+        sim.overlap_bits_buf.write(&bits).enq().expect("bit matrix upload failed");
+        sim.degree_buf.write(&degree).enq().expect("degree upload failed");
+        sim.step(0.001, [0.0, 0.0, 0.0], 0.5, 10.0, 0.0, 1.0, true).expect("collision kernels failed");
+        sim.pro_que.queue().finish().expect("collision queue failed");
+
+        let mut old_input = vec![0.0f32; n*4];
+        sim.pos_out.read(&mut old_input).enq().expect("old input read failed");
+        assert_eq!(old_input, pos, "collision kernel modified its input snapshot");
+        let out = sim.read_positions();
+        assert!(out[0][0] < -1e-6, "pathological group did not process partner 39");
+        assert!(out[39*super::GROUP_SIZE][0] > 0.150001, "normal reverse row did not process group 0");
+    }
+
+    #[test]
+    #[ignore = "manual target-scale performance diagnostic"]
+    fn headless_target_scale_benchmark() {
+        let n = 16384;
+        let mut sim = super::CollisionOcl::new(n, super::GROUP_SIZE, [-20.0, -20.0, -20.0], [20.0, 20.0, 20.0], 0.1).expect("OpenCL initialization failed");
+        for _ in 0..3 {
+            sim.compute_aabbs().unwrap(); sim.compute_overlaps().unwrap();
+            sim.step(0.005, [0.0, 0.0, 9.81], 0.5, 1000.0, 10.0, 0.999, true).unwrap();
+        }
+        sim.pro_que.queue().finish().unwrap();
+        let mut broad_ms = 0.0f64;
+        let mut narrow_ms = 0.0f64;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            sim.compute_aabbs().unwrap(); sim.compute_overlaps().unwrap(); sim.pro_que.queue().finish().unwrap();
+            broad_ms += t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            sim.step(0.005, [0.0, 0.0, 9.81], 0.5, 1000.0, 10.0, 0.999, true).unwrap(); sim.pro_que.queue().finish().unwrap();
+            narrow_ms += t.elapsed().as_secs_f64() * 1000.0;
+        }
+        sim.compute_aabbs().unwrap(); sim.compute_overlaps().unwrap(); sim.pro_que.queue().finish().unwrap();
+        let t = std::time::Instant::now();
+        let map = sim.read_group_map();
+        let mut pos: Vec<f32> = sim.read_positions().into_iter().flatten().collect();
+        let mut vel: Vec<f32> = sim.read_velocities().into_iter().flatten().collect();
+        let repaired = super::rebalance_retile(&mut pos, &mut vel, &map, super::GROUP_SIZE, n, 8);
+        if repaired > 0 { sim.write_pos_vel(&pos, &vel); sim.pro_que.queue().finish().unwrap(); }
+        let repair_ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!("target-scale: broad={:.3} ms, narrow={:.3} ms, retile={} in {:.3} ms", broad_ms/10.0, narrow_ms/10.0, repaired, repair_ms);
+    }
 }

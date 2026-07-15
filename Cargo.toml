@@ -10,6 +10,7 @@ members = [
     "examples/demo08_molecule_viewer",
     "examples/demo09_collision_debug",
     "examples/demo10_collision_balls",
+    "examples/demo11_collision_grid",
     "mol_utils",
     "mol_topology",
     "mol_engine",
