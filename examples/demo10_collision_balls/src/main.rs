@@ -1,12 +1,20 @@
 //! demo10_collision_balls — OpenCL collision sim with group-based broad phase.
 //!
-//! GPU does physics + AABB + overlap detection every frame.
-//! CPU does rare rebalancing (Morton sort, greedy swaps, 2W retile) + mouse interaction.
+//! This is a laboratory for the trade-off between compact fixed-size collision
+//! groups and the cost of repairing their spatial ownership as particles move.
+//! GPU performs physics, AABB construction, and exact overlap detection every
+//! frame; the UI compares sequential CPU, snapshot CPU, hybrid, and device-
+//! resident repair paths without changing the normal collision kernel.
 //!
 //! See README.md for full architecture, algorithm details, and open issues.
 //!
 //! Data layout: pos = (x, y, z, radius), vel = (vx, vy, vz, inv_mass).
 //! Groups are contiguous: group g = particles [g*W, (g+1)*W).
+//!
+//! The non-obvious boundary is semantic: the old CPU retile is sequential,
+//! while hybrid/GPU repair is a Jacobi-style round against one immutable map
+//! snapshot. Keeping both is intentional because this executable is a parity
+//! and benchmarking platform, not a claim that one policy is universally best.
 
 use eframe::egui;
 use ocl::{ProQue, Buffer, flags, prm::Float4};
@@ -50,14 +58,19 @@ fn sort_by_morton(pos: &mut Vec<f32>, vel: &mut Vec<f32>, box_min: &[f32; 3], bo
 const KERNEL_SRC: &str = include_str!("collision_kernel.cl");
 const GROUP_SIZE: usize = 32;
 const PATHOLOGICAL_DEGREE: usize = 32;
+const RETILE_SIZE: usize = 2 * GROUP_SIZE;
+const MAX_REBALANCE_PAIRS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RebalanceStrategy { Retile, GreedySwaps, SwapsThenRetile, Morton }
+enum RebalanceStrategy { Retile, SnapshotRetile, HybridRetile, GpuRetile, GreedySwaps, SwapsThenRetile, Morton }
 
 impl RebalanceStrategy {
     fn label(self) -> &'static str {
         match self {
-            Self::Retile => "2W retile",
+            Self::Retile => "CPU sequential retile",
+            Self::SnapshotRetile => "CPU snapshot full-transfer",
+            Self::HybridRetile => "Hybrid staged retile",
+            Self::GpuRetile => "GPU snapshot retile",
             Self::GreedySwaps => "Greedy swaps",
             Self::SwapsThenRetile => "Swaps + retile",
             Self::Morton => "Morton rebuild",
@@ -111,6 +124,7 @@ impl GroupMap {
 ///   aabb_min_buf, aabb_max_buf — per-group float4 AABBs (n_groups entries)
 ///   overlap_bits_buf — exact n_groups * ceil(n_groups / 32) bit matrix
 ///   degree_buf — exact overlap degree used for fast/slow-path selection
+///   retile_pair/stage/accepted buffers — persistent hybrid/GPU benchmark state
 ///
 /// Kernels are pre-built with fixed args; only dynamic args (dt, gravity, etc.)
 /// are updated via set_arg in step(). Arg indices must match kernel declaration order.
@@ -128,6 +142,10 @@ struct CollisionOcl {
     aabb_max_buf: Buffer<f32>,
     overlap_bits_buf: Buffer<u32>,
     degree_buf: Buffer<u32>,
+    retile_pair_buf: Buffer<u32>,
+    retile_stage_pos_buf: Buffer<f32>,
+    retile_stage_vel_buf: Buffer<f32>,
+    retile_accepted_buf: Buffer<u32>,
     n: usize,
     n_groups: usize,
     n_words: usize,
@@ -136,6 +154,9 @@ struct CollisionOcl {
     aabb_kernel: ocl::Kernel,
     overlap_bits_kernel: ocl::Kernel,
     overlap_degrees_kernel: ocl::Kernel,
+    retile_gather_kernel: ocl::Kernel,
+    retile_commit_kernel: ocl::Kernel,
+    retile_gpu_kernel: ocl::Kernel,
 }
 
 impl CollisionOcl {
@@ -213,6 +234,26 @@ impl CollisionOcl {
             .flags(flags::MEM_READ_WRITE)
             .len(n_groups)
             .build()?;
+        let retile_pair_buf = Buffer::<u32>::builder()
+            .queue(pro_que.queue().clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(MAX_REBALANCE_PAIRS * 2)
+            .build()?;
+        let retile_stage_pos_buf = Buffer::<f32>::builder()
+            .queue(pro_que.queue().clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(MAX_REBALANCE_PAIRS * RETILE_SIZE * 4)
+            .build()?;
+        let retile_stage_vel_buf = Buffer::<f32>::builder()
+            .queue(pro_que.queue().clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(MAX_REBALANCE_PAIRS * RETILE_SIZE * 4)
+            .build()?;
+        let retile_accepted_buf = Buffer::<u32>::builder()
+            .queue(pro_que.queue().clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(MAX_REBALANCE_PAIRS)
+            .build()?;
         let n_padded = n_groups * GROUP_SIZE;
         let collision_normal_kernel = pro_que.kernel_builder("collision_step_normal")
             .global_work_size(n_padded)
@@ -283,7 +324,41 @@ impl CollisionOcl {
             .arg(n_words as i32)
             .build()?;
 
-        Ok(Self { pro_que, pos_in, vel_in, pos_out, vel_out, aabb_min_buf, aabb_max_buf, overlap_bits_buf, degree_buf, n, n_groups, n_words, collision_normal_kernel, collision_pathological_kernel, aabb_kernel, overlap_bits_kernel, overlap_degrees_kernel })
+        let retile_work_items = MAX_REBALANCE_PAIRS * RETILE_SIZE;
+        let retile_gather_kernel = pro_que.kernel_builder("gather_retile_pairs")
+            .global_work_size(retile_work_items)
+            .local_work_size(RETILE_SIZE)
+            .arg(&pos_in)
+            .arg(&vel_in)
+            .arg(&retile_pair_buf)
+            .arg(&retile_stage_pos_buf)
+            .arg(&retile_stage_vel_buf)
+            .arg(0i32)
+            .build()?;
+        let retile_commit_kernel = pro_que.kernel_builder("commit_retile_pairs")
+            .global_work_size(retile_work_items)
+            .local_work_size(RETILE_SIZE)
+            .arg(&retile_stage_pos_buf)
+            .arg(&retile_stage_vel_buf)
+            .arg(&retile_pair_buf)
+            .arg(&pos_in)
+            .arg(&vel_in)
+            .arg(0i32)
+            .build()?;
+        let retile_gpu_kernel = pro_que.kernel_builder("retile_pairs_gpu")
+            .global_work_size(retile_work_items)
+            .local_work_size(RETILE_SIZE)
+            .arg(&pos_in)
+            .arg(&vel_in)
+            .arg(&aabb_min_buf)
+            .arg(&aabb_max_buf)
+            .arg(&retile_pair_buf)
+            .arg(&retile_accepted_buf)
+            .arg(n_groups as i32)
+            .arg(0i32)
+            .build()?;
+
+        Ok(Self { pro_que, pos_in, vel_in, pos_out, vel_out, aabb_min_buf, aabb_max_buf, overlap_bits_buf, degree_buf, retile_pair_buf, retile_stage_pos_buf, retile_stage_vel_buf, retile_accepted_buf, n, n_groups, n_words, collision_normal_kernel, collision_pathological_kernel, aabb_kernel, overlap_bits_kernel, overlap_degrees_kernel, retile_gather_kernel, retile_commit_kernel, retile_gpu_kernel })
     }
 
     fn step(&mut self, dt: f32, gravity: [f32; 3], restitution: f32, k_spring: f32, k_damp: f32, vel_damping: f32, constrain_2d: bool) -> ocl::Result<()> {
@@ -376,6 +451,63 @@ impl CollisionOcl {
         let map = GroupMap { amins, amaxs, bits: self.read_overlap_bits(), degree: self.read_degrees(), n_words: self.n_words };
         map.validate();
         map
+    }
+
+    fn upload_retile_pairs(&self, pairs: &[(usize, usize)]) -> ocl::Result<()> {
+        validate_retile_pairs(pairs, self.n_groups);
+        assert!(pairs.len() <= MAX_REBALANCE_PAIRS, "{} retile pairs exceed staging capacity {}", pairs.len(), MAX_REBALANCE_PAIRS);
+        let mut flat = Vec::with_capacity(pairs.len() * 2);
+        for &(g, h) in pairs {
+            flat.push(g as u32);
+            flat.push(h as u32);
+        }
+        if !flat.is_empty() { self.retile_pair_buf.write(flat.as_slice()).enq()?; }
+        Ok(())
+    }
+
+    /// Hybrid backend: gather only selected groups, run the deterministic CPU
+    /// snapshot algorithm on the compact records, then commit those groups.
+    fn retile_hybrid(&mut self, map: &GroupMap, pairs: &[(usize, usize)]) -> ocl::Result<usize> {
+        if pairs.is_empty() { return Ok(0); }
+        self.upload_retile_pairs(pairs)?;
+        self.retile_gather_kernel.set_arg(0, &self.pos_in)?;
+        self.retile_gather_kernel.set_arg(1, &self.vel_in)?;
+        self.retile_gather_kernel.set_arg(5, pairs.len() as i32)?;
+        unsafe { self.retile_gather_kernel.enq()?; }
+
+        let n_records = pairs.len() * RETILE_SIZE;
+        let mut pos = vec![0.0f32; n_records * 4];
+        let mut vel = vec![0.0f32; n_records * 4];
+        self.retile_stage_pos_buf.read(pos.as_mut_slice()).enq()?;
+        self.retile_stage_vel_buf.read(vel.as_mut_slice()).enq()?;
+        validate_particle_state(&pos, &vel, n_records);
+        let accepted = retile_compact_snapshot(&mut pos, &mut vel, map, pairs);
+        validate_particle_state(&pos, &vel, n_records);
+        if accepted == 0 { return Ok(0); }
+
+        self.retile_stage_pos_buf.write(pos.as_slice()).enq()?;
+        self.retile_stage_vel_buf.write(vel.as_slice()).enq()?;
+        self.retile_commit_kernel.set_arg(3, &self.pos_in)?;
+        self.retile_commit_kernel.set_arg(4, &self.vel_in)?;
+        self.retile_commit_kernel.set_arg(5, pairs.len() as i32)?;
+        unsafe { self.retile_commit_kernel.enq()?; }
+        self.pro_que.queue().finish()?;
+        Ok(accepted)
+    }
+
+    /// Fully GPU-resident backend. Pair selection remains deliberately on the
+    /// CPU because the exact map is tiny; particle records never leave device.
+    fn retile_gpu(&mut self, pairs: &[(usize, usize)]) -> ocl::Result<usize> {
+        if pairs.is_empty() { return Ok(0); }
+        self.upload_retile_pairs(pairs)?;
+        self.retile_gpu_kernel.set_arg(0, &self.pos_in)?;
+        self.retile_gpu_kernel.set_arg(1, &self.vel_in)?;
+        self.retile_gpu_kernel.set_arg(7, pairs.len() as i32)?;
+        unsafe { self.retile_gpu_kernel.enq()?; }
+        let mut accepted = vec![0u32; pairs.len()];
+        self.retile_accepted_buf.read(accepted.as_mut_slice()).enq()?;
+        assert!(accepted.iter().all(|&x| x <= 1), "GPU retile returned a non-boolean acceptance flag");
+        Ok(accepted.into_iter().map(|x| x as usize).sum())
     }
 }
 
@@ -476,6 +608,34 @@ fn ranked_overlap_pairs(map: &GroupMap) -> Vec<(usize, usize)> {
     }
     pairs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| b.2.total_cmp(&a.2)).then_with(|| a.3.cmp(&b.3)).then_with(|| a.4.cmp(&b.4)));
     pairs.into_iter().map(|(_, _, _, g, h)| (g, h)).collect()
+}
+
+/// Build one deterministic Jacobi-style repair round. Every group appears at
+/// most once, so pair evaluation and commitment are race-free and independent.
+fn select_disjoint_retile_pairs(map: &GroupMap, max_pairs: usize) -> Vec<(usize, usize)> {
+    let limit = max_pairs.min(MAX_REBALANCE_PAIRS);
+    let mut used = vec![false; map.degree.len()];
+    let mut selected = Vec::with_capacity(limit);
+    for (g, h) in ranked_overlap_pairs(map) {
+        if selected.len() == limit { break; }
+        if used[g] || used[h] { continue; }
+        used[g] = true;
+        used[h] = true;
+        selected.push((g, h));
+    }
+    validate_retile_pairs(&selected, map.degree.len());
+    selected
+}
+
+fn validate_retile_pairs(pairs: &[(usize, usize)], n_groups: usize) {
+    let mut used = vec![false; n_groups];
+    for (p, &(g, h)) in pairs.iter().enumerate() {
+        assert!(g < h, "retile pair {p} must be canonical, got ({g},{h})");
+        assert!(h < n_groups, "retile pair {p} group {h} exceeds group count {n_groups}");
+        assert!(!used[g] && !used[h], "retile pair {p} reuses group {g} or {h}");
+        used[g] = true;
+        used[h] = true;
+    }
 }
 
 /// Greedy pairwise swap rebalancing.
@@ -627,6 +787,93 @@ fn cost_better(a: (usize, f32), b: (usize, f32)) -> bool {
     a.0 < b.0 || (a.0 == b.0 && a.1 < b.1 - 1e-6)
 }
 
+struct RetileDecision {
+    order: Vec<usize>,
+    gmin: [f32; 4],
+    gmax: [f32; 4],
+    hmin: [f32; 4],
+    hmax: [f32; 4],
+}
+
+fn choose_retile(merged_pos: &[f32], g: usize, h: usize, amins: &[[f32; 4]], amaxs: &[[f32; 4]]) -> Option<RetileDecision> {
+    assert_eq!(merged_pos.len(), RETILE_SIZE * 4);
+    let old_cost = pair_cost(g, h, &amins[g], &amaxs[g], &amins[h], &amaxs[h], amins, amaxs);
+    let dir_x = (amaxs[h][0] + amins[h][0] - amaxs[g][0] - amins[g][0]) * 0.5;
+    let dir_z = (amaxs[h][2] + amins[h][2] - amaxs[g][2] - amins[g][2]) * 0.5;
+    let mut best_cost = old_cost;
+    let mut best = None;
+    for &(dx, dz) in &[(1.0f32, 0.0f32), (0.0, 1.0), (dir_x, dir_z)] {
+        if dx*dx + dz*dz <= 1e-20 { continue; }
+        let mut order: Vec<usize> = (0..RETILE_SIZE).collect();
+        order.sort_by(|&a, &b| {
+            let sa = merged_pos[a*4]*dx + merged_pos[a*4+2]*dz;
+            let sb = merged_pos[b*4]*dx + merged_pos[b*4+2]*dz;
+            sa.total_cmp(&sb).then_with(|| a.cmp(&b))
+        });
+        let (gmin, gmax) = ordered_aabb(merged_pos, &order[..GROUP_SIZE]);
+        let (hmin, hmax) = ordered_aabb(merged_pos, &order[GROUP_SIZE..]);
+        let candidate_cost = pair_cost(g, h, &gmin, &gmax, &hmin, &hmax, amins, amaxs);
+        if cost_better(candidate_cost, best_cost) {
+            best_cost = candidate_cost;
+            best = Some(RetileDecision { order, gmin, gmax, hmin, hmax });
+        }
+    }
+    best
+}
+
+fn apply_retile_decision(pos: &mut [f32], vel: &mut [f32], decision: &RetileDecision) {
+    assert_eq!(pos.len(), RETILE_SIZE * 4);
+    assert_eq!(vel.len(), RETILE_SIZE * 4);
+    let old_pos = pos.to_vec();
+    let old_vel = vel.to_vec();
+    for (dst, &src) in decision.order.iter().enumerate() {
+        pos[dst*4..dst*4+4].copy_from_slice(&old_pos[src*4..src*4+4]);
+        vel[dst*4..dst*4+4].copy_from_slice(&old_vel[src*4..src*4+4]);
+    }
+}
+
+/// CPU reference for the hybrid/GPU backends. Each pair is evaluated against
+/// the same immutable map snapshot; pairs occupy disjoint compact ranges.
+fn retile_compact_snapshot(pos: &mut [f32], vel: &mut [f32], map: &GroupMap, pairs: &[(usize, usize)]) -> usize {
+    validate_retile_pairs(pairs, map.degree.len());
+    assert_eq!(pos.len(), pairs.len() * RETILE_SIZE * 4);
+    assert_eq!(vel.len(), pos.len());
+    let mut accepted = 0;
+    for (p, &(g, h)) in pairs.iter().enumerate() {
+        let begin = p * RETILE_SIZE * 4;
+        let end = begin + RETILE_SIZE * 4;
+        if let Some(decision) = choose_retile(&pos[begin..end], g, h, &map.amins, &map.amaxs) {
+            apply_retile_decision(&mut pos[begin..end], &mut vel[begin..end], &decision);
+            accepted += 1;
+        }
+    }
+    accepted
+}
+
+fn rebalance_retile_snapshot(pos: &mut [f32], vel: &mut [f32], map: &GroupMap, pairs: &[(usize, usize)]) -> usize {
+    validate_particle_state(pos, vel, pos.len() / 4);
+    validate_retile_pairs(pairs, map.degree.len());
+    let mut compact_pos = Vec::with_capacity(pairs.len() * RETILE_SIZE * 4);
+    let mut compact_vel = Vec::with_capacity(pairs.len() * RETILE_SIZE * 4);
+    for &(g, h) in pairs {
+        compact_pos.extend_from_slice(&pos[g*GROUP_SIZE*4..(g+1)*GROUP_SIZE*4]);
+        compact_pos.extend_from_slice(&pos[h*GROUP_SIZE*4..(h+1)*GROUP_SIZE*4]);
+        compact_vel.extend_from_slice(&vel[g*GROUP_SIZE*4..(g+1)*GROUP_SIZE*4]);
+        compact_vel.extend_from_slice(&vel[h*GROUP_SIZE*4..(h+1)*GROUP_SIZE*4]);
+    }
+    let accepted = retile_compact_snapshot(&mut compact_pos, &mut compact_vel, map, pairs);
+    if accepted > 0 {
+        for (p, &(g, h)) in pairs.iter().enumerate() {
+            let begin = p * RETILE_SIZE * 4;
+            pos[g*GROUP_SIZE*4..(g+1)*GROUP_SIZE*4].copy_from_slice(&compact_pos[begin..begin+GROUP_SIZE*4]);
+            pos[h*GROUP_SIZE*4..(h+1)*GROUP_SIZE*4].copy_from_slice(&compact_pos[begin+GROUP_SIZE*4..begin+RETILE_SIZE*4]);
+            vel[g*GROUP_SIZE*4..(g+1)*GROUP_SIZE*4].copy_from_slice(&compact_vel[begin..begin+GROUP_SIZE*4]);
+            vel[h*GROUP_SIZE*4..(h+1)*GROUP_SIZE*4].copy_from_slice(&compact_vel[begin+GROUP_SIZE*4..begin+RETILE_SIZE*4]);
+        }
+    }
+    accepted
+}
+
 fn rebalance_retile(pos: &mut Vec<f32>, vel: &mut Vec<f32>, map: &GroupMap, w: usize, n: usize, max_pairs: usize) -> usize {
     let n_groups = map.degree.len();
     assert_eq!(n_groups * w, n);
@@ -647,35 +894,13 @@ fn rebalance_retile(pos: &mut Vec<f32>, vel: &mut Vec<f32>, map: &GroupMap, w: u
         merged_vel.extend_from_slice(&vel[lo_g*4..(lo_g+w)*4]);
         merged_vel.extend_from_slice(&vel[lo_h*4..(lo_h+w)*4]);
 
-        let old_cost = pair_cost(g, h, &amins[g], &amaxs[g], &amins[h], &amaxs[h], &amins, &amaxs);
-        let dir_x = (amaxs[h][0] + amins[h][0] - amaxs[g][0] - amins[g][0]) * 0.5;
-        let dir_z = (amaxs[h][2] + amins[h][2] - amaxs[g][2] - amins[g][2]) * 0.5;
-        let mut best_cost = old_cost;
-        let mut best: Option<(Vec<usize>, [f32; 4], [f32; 4], [f32; 4], [f32; 4])> = None;
-        for &(dx, dz) in &[(1.0f32, 0.0f32), (0.0, 1.0), (dir_x, dir_z)] {
-            if dx*dx + dz*dz <= 1e-20 { continue; }
-            let mut order: Vec<usize> = (0..2*w).collect();
-            order.sort_by(|&a, &b| {
-                let sa = merged_pos[a*4]*dx + merged_pos[a*4+2]*dz;
-                let sb = merged_pos[b*4]*dx + merged_pos[b*4+2]*dz;
-                sa.total_cmp(&sb).then_with(|| a.cmp(&b))
-            });
-            let (gmin, gmax) = ordered_aabb(&merged_pos, &order[..w]);
-            let (hmin, hmax) = ordered_aabb(&merged_pos, &order[w..]);
-            let candidate_cost = pair_cost(g, h, &gmin, &gmax, &hmin, &hmax, &amins, &amaxs);
-            if cost_better(candidate_cost, best_cost) {
-                best_cost = candidate_cost;
-                best = Some((order, gmin, gmax, hmin, hmax));
-            }
-        }
-        let Some((order, gmin, gmax, hmin, hmax)) = best else { continue; };
-
-        for (k, &src) in order.iter().enumerate() {
-            let target = if k < w { lo_g + k } else { lo_h + k - w };
-            pos[target*4..target*4+4].copy_from_slice(&merged_pos[src*4..src*4+4]);
-            vel[target*4..target*4+4].copy_from_slice(&merged_vel[src*4..src*4+4]);
-        }
-        amins[g] = gmin; amaxs[g] = gmax; amins[h] = hmin; amaxs[h] = hmax;
+        let Some(decision) = choose_retile(&merged_pos, g, h, &amins, &amaxs) else { continue; };
+        apply_retile_decision(&mut merged_pos, &mut merged_vel, &decision);
+        pos[lo_g*4..(lo_g+w)*4].copy_from_slice(&merged_pos[..w*4]);
+        pos[lo_h*4..(lo_h+w)*4].copy_from_slice(&merged_pos[w*4..]);
+        vel[lo_g*4..(lo_g+w)*4].copy_from_slice(&merged_vel[..w*4]);
+        vel[lo_h*4..(lo_h+w)*4].copy_from_slice(&merged_vel[w*4..]);
+        amins[g] = decision.gmin; amaxs[g] = decision.gmax; amins[h] = decision.hmin; amaxs[h] = decision.hmax;
         used_groups[g] = true; used_groups[h] = true;
         n_retiled += 1;
     }
@@ -744,6 +969,7 @@ struct CollisionApp {
     rebuild_degree_trigger: usize,
     max_rebalance_ops: usize,
     ms_rebalance: f32,
+    last_rebalance_transfer_bytes: usize,
     frame_count: usize,
     n_overlap: usize,           // total unique overlap pairs (from GPU)
     n_overflow: usize,           // groups whose exact degree exceeds the fast-path threshold
@@ -795,6 +1021,7 @@ impl CollisionApp {
             rebuild_degree_trigger: 24,
             max_rebalance_ops: 8,
             ms_rebalance: 0.0,
+            last_rebalance_transfer_bytes: 0,
             frame_count: 0,
             n_overlap: 0,
             n_overflow: 0,
@@ -821,35 +1048,62 @@ impl CollisionApp {
 
     fn apply_rebalance(&mut self, strategy: RebalanceStrategy, map: &GroupMap) -> bool {
         let t0 = Instant::now();
-        let mut pos: Vec<f32> = self.sim.read_positions().into_iter().flat_map(|p| p.into_iter()).collect();
-        let mut vel: Vec<f32> = self.sim.read_velocities().into_iter().flat_map(|v| v.into_iter()).collect();
-        validate_particle_state(&pos, &vel, self.n);
         self.last_swaps = 0;
         self.last_retiles = 0;
+        self.last_rebalance_transfer_bytes = 0;
         let changed = match strategy {
-            RebalanceStrategy::GreedySwaps => {
-                self.last_swaps = rebalance_swaps(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
-                self.last_swaps > 0
-            }
-            RebalanceStrategy::Retile => {
-                self.last_retiles = rebalance_retile(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+            RebalanceStrategy::HybridRetile => {
+                let pairs = select_disjoint_retile_pairs(map, self.max_rebalance_ops);
+                self.last_retiles = self.sim.retile_hybrid(map, &pairs).expect("hybrid retile failed");
+                let compact_bytes = pairs.len() * RETILE_SIZE * 2 * 16;
+                self.last_rebalance_transfer_bytes = pairs.len() * 2 * 4 + compact_bytes + usize::from(self.last_retiles > 0) * compact_bytes;
                 self.last_retiles > 0
             }
-            RebalanceStrategy::SwapsThenRetile => {
-                self.last_swaps = rebalance_swaps(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
-                self.last_retiles = rebalance_retile(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
-                self.last_swaps > 0 || self.last_retiles > 0
+            RebalanceStrategy::GpuRetile => {
+                let pairs = select_disjoint_retile_pairs(map, self.max_rebalance_ops);
+                self.last_retiles = self.sim.retile_gpu(&pairs).expect("GPU retile failed");
+                self.last_rebalance_transfer_bytes = pairs.len() * (2 * 4 + 4);
+                self.last_retiles > 0
             }
-            RebalanceStrategy::Morton => {
-                sort_by_morton(&mut pos, &mut vel, &self.box_min, &self.box_max);
-                true
+            _ => {
+                let mut pos: Vec<f32> = self.sim.read_positions().into_iter().flat_map(|p| p.into_iter()).collect();
+                let mut vel: Vec<f32> = self.sim.read_velocities().into_iter().flat_map(|v| v.into_iter()).collect();
+                validate_particle_state(&pos, &vel, self.n);
+                self.last_rebalance_transfer_bytes = self.n * 2 * 16;
+                let cpu_changed = match strategy {
+                    RebalanceStrategy::GreedySwaps => {
+                        self.last_swaps = rebalance_swaps(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+                        self.last_swaps > 0
+                    }
+                    RebalanceStrategy::Retile => {
+                        self.last_retiles = rebalance_retile(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+                        self.last_retiles > 0
+                    }
+                    RebalanceStrategy::SnapshotRetile => {
+                        let pairs = select_disjoint_retile_pairs(map, self.max_rebalance_ops);
+                        self.last_retiles = rebalance_retile_snapshot(&mut pos, &mut vel, map, &pairs);
+                        self.last_retiles > 0
+                    }
+                    RebalanceStrategy::SwapsThenRetile => {
+                        self.last_swaps = rebalance_swaps(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+                        self.last_retiles = rebalance_retile(&mut pos, &mut vel, map, self.w, self.n, self.max_rebalance_ops);
+                        self.last_swaps > 0 || self.last_retiles > 0
+                    }
+                    RebalanceStrategy::Morton => {
+                        sort_by_morton(&mut pos, &mut vel, &self.box_min, &self.box_max);
+                        true
+                    }
+                    RebalanceStrategy::HybridRetile | RebalanceStrategy::GpuRetile => unreachable!(),
+                };
+                validate_particle_state(&pos, &vel, self.n);
+                if cpu_changed {
+                    self.sim.write_pos_vel(&pos, &vel);
+                    self.sim.pro_que.queue().finish().expect("rebalanced state upload failed");
+                    self.last_rebalance_transfer_bytes += self.n * 2 * 16;
+                }
+                cpu_changed
             }
         };
-        validate_particle_state(&pos, &vel, self.n);
-        if changed {
-            self.sim.write_pos_vel(&pos, &vel);
-            self.sim.pro_que.queue().finish().expect("rebalanced state upload failed");
-        }
         self.ms_rebalance = t0.elapsed().as_secs_f32() * 1000.0;
         changed
     }
@@ -891,13 +1145,16 @@ impl eframe::App for CollisionApp {
             egui::ComboBox::from_label("Strategy")
                 .selected_text(self.rebalance_strategy.label())
                 .show_ui(ui, |ui| {
-                    for strategy in [RebalanceStrategy::Retile, RebalanceStrategy::GreedySwaps, RebalanceStrategy::SwapsThenRetile, RebalanceStrategy::Morton] {
+                    for strategy in [RebalanceStrategy::Retile, RebalanceStrategy::SnapshotRetile, RebalanceStrategy::HybridRetile, RebalanceStrategy::GpuRetile, RebalanceStrategy::GreedySwaps, RebalanceStrategy::SwapsThenRetile, RebalanceStrategy::Morton] {
                         ui.selectable_value(&mut self.rebalance_strategy, strategy, strategy.label());
                     }
                 });
             ui.add(egui::Slider::new(&mut self.rebuild_interval, 10..=200).text("interval (frames)"));
             ui.add(egui::Slider::new(&mut self.rebuild_degree_trigger, 1..=64).text("degree trigger"));
-            ui.add(egui::Slider::new(&mut self.max_rebalance_ops, 1..=32).text("max local repairs"));
+            ui.add(egui::Slider::new(&mut self.max_rebalance_ops, 1..=MAX_REBALANCE_PAIRS).text("max repair pairs"));
+            if ui.button("Run selected strategy").clicked() {
+                self.manual_rebalance(self.rebalance_strategy);
+            }
             if ui.button("Morton rebuild").clicked() {
                 self.manual_rebalance(RebalanceStrategy::Morton);
             }
@@ -912,6 +1169,7 @@ impl eframe::App for CollisionApp {
             ui.label(format!("Pathological groups: {} | Surf: {:.1}", self.n_overflow, self.total_surf));
             ui.label(format!("Last swaps: {} | retiles: {}", self.last_swaps, self.last_retiles));
             ui.label(format!("Last rebalance: {:.2} ms", self.ms_rebalance));
+            ui.label(format!("Backend state transfer: {:.1} KiB", self.last_rebalance_transfer_bytes as f32 / 1024.0));
             ui.separator();
             ui.label(format!("GPU step: {:.2} ms (broad: {:.2} narrow: {:.2})", self.ms_per_step, self.ms_broad, self.ms_narrow));
         });
@@ -1140,6 +1398,12 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
+    static OPENCL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_opencl() -> std::sync::MutexGuard<'static, ()> {
+        OPENCL_TEST_LOCK.lock().expect("OpenCL test lock poisoned by an earlier failure")
+    }
+
     #[derive(Clone, Copy)]
     struct Box2 { min_x: f32, max_x: f32, min_z: f32, max_z: f32 }
 
@@ -1170,6 +1434,35 @@ mod tests {
         let map = super::GroupMap { amins, amaxs, bits, degree, n_words: (n_groups + 31) / 32 };
         map.validate();
         map
+    }
+
+    fn crossed_pair_fixture(n_pairs: usize) -> (Vec<f32>, Vec<f32>) {
+        let n = n_pairs * 2 * super::GROUP_SIZE;
+        let mut pos = vec![0.0f32; n * 4];
+        let mut vel = vec![0.0f32; n * 4];
+        for i in 0..n {
+            let g = i / super::GROUP_SIZE;
+            let local = i % super::GROUP_SIZE;
+            let pair = g / 2;
+            let x = if g % 2 == 0 {
+                if local < super::GROUP_SIZE / 2 { -10.0 } else { 10.0 }
+            } else if local < super::GROUP_SIZE / 2 { -9.0 } else { 9.0 };
+            let z = pair as f32 * 10.0;
+            pos[i*4] = x;
+            pos[i*4+2] = z;
+            pos[i*4+3] = 0.1;
+            vel[i*4] = i as f32;
+            vel[i*4+1] = x;
+            vel[i*4+2] = z;
+            vel[i*4+3] = 1.0;
+        }
+        (pos, vel)
+    }
+
+    fn read_flat_state(sim: &super::CollisionOcl) -> (Vec<f32>, Vec<f32>) {
+        let pos = sim.read_positions().into_iter().flatten().collect();
+        let vel = sim.read_velocities().into_iter().flatten().collect();
+        (pos, vel)
     }
 
     #[test]
@@ -1241,7 +1534,89 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_and_gpu_retile_match_snapshot_cpu_reference() {
+        let _opencl = lock_opencl();
+        let n_pairs = 2;
+        let n_groups = n_pairs * 2;
+        let n = n_groups * super::GROUP_SIZE;
+        let (input_pos, input_vel) = crossed_pair_fixture(n_pairs);
+        let host_map = make_group_map(&input_pos, n_groups);
+        let mut selected = super::select_disjoint_retile_pairs(&host_map, n_pairs);
+        selected.sort_unstable();
+        assert_eq!(selected, vec![(0, 1), (2, 3)]);
+        let pairs = vec![(0, 1), (2, 3)];
+
+        let mut expected_pos = input_pos.clone();
+        let mut expected_vel = input_vel.clone();
+        let expected_accepted = super::rebalance_retile_snapshot(&mut expected_pos, &mut expected_vel, &host_map, &pairs);
+        assert_eq!(expected_accepted, n_pairs);
+
+        let mut sim = super::CollisionOcl::new(n, super::GROUP_SIZE, [-30.0, -30.0, -30.0], [30.0, 30.0, 30.0], 0.1).expect("OpenCL initialization failed");
+        sim.write_pos_vel(&input_pos, &input_vel);
+        sim.compute_aabbs().expect("hybrid AABB build failed");
+        sim.compute_overlaps().expect("hybrid overlap build failed");
+        sim.pro_que.queue().finish().expect("hybrid map queue failed");
+        let gpu_map = sim.read_group_map();
+        assert_eq!(gpu_map.bits, host_map.bits, "CPU/GPU pair topology differs before repair");
+        let hybrid_accepted = sim.retile_hybrid(&gpu_map, &pairs).expect("hybrid retile failed");
+        assert_eq!(hybrid_accepted, expected_accepted);
+        let (hybrid_pos, hybrid_vel) = read_flat_state(&sim);
+        assert_eq!(hybrid_pos, expected_pos, "hybrid positions differ from snapshot CPU reference");
+        assert_eq!(hybrid_vel, expected_vel, "hybrid velocities differ from snapshot CPU reference");
+
+        sim.write_pos_vel(&input_pos, &input_vel);
+        sim.compute_aabbs().expect("GPU AABB build failed");
+        sim.compute_overlaps().expect("GPU overlap build failed");
+        sim.pro_que.queue().finish().expect("GPU map queue failed");
+        let gpu_accepted = sim.retile_gpu(&pairs).expect("GPU retile failed");
+        assert_eq!(gpu_accepted, expected_accepted);
+        let (gpu_pos, gpu_vel) = read_flat_state(&sim);
+        assert_eq!(gpu_pos, expected_pos, "GPU positions differ from snapshot CPU reference");
+        assert_eq!(gpu_vel, expected_vel, "GPU velocities differ from snapshot CPU reference");
+
+        let mut ids: Vec<usize> = gpu_vel.chunks_exact(4).map(|v| v[0] as usize).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..n).collect::<Vec<_>>(), "GPU retile duplicated or lost a particle record");
+        for i in 0..n {
+            assert_eq!(gpu_pos[i*4], gpu_vel[i*4+1], "position/velocity record split at slot {i}");
+            assert_eq!(gpu_pos[i*4+2], gpu_vel[i*4+2], "position/velocity z record split at slot {i}");
+        }
+    }
+
+    #[test]
+    fn hybrid_and_gpu_rejected_pair_are_exact_noops() {
+        let _opencl = lock_opencl();
+        let n = 2 * super::GROUP_SIZE;
+        let mut pos = vec![0.0f32; n * 4];
+        let mut vel = vec![0.0f32; n * 4];
+        for i in 0..n {
+            let g = i / super::GROUP_SIZE;
+            let local = i % super::GROUP_SIZE;
+            pos[i*4] = if g == 0 { -5.0 + local as f32 * 0.01 } else { 5.0 + local as f32 * 0.01 };
+            pos[i*4+3] = 0.1;
+            vel[i*4] = i as f32;
+            vel[i*4+1] = pos[i*4];
+            vel[i*4+3] = 1.0;
+        }
+        let map = make_group_map(&pos, 2);
+        assert_eq!(map.degree, vec![0, 0]);
+        let pairs = vec![(0usize, 1usize)];
+        let mut sim = super::CollisionOcl::new(n, super::GROUP_SIZE, [-10.0, -10.0, -10.0], [10.0, 10.0, 10.0], 0.1).expect("OpenCL initialization failed");
+
+        sim.write_pos_vel(&pos, &vel);
+        assert_eq!(sim.retile_hybrid(&map, &pairs).expect("hybrid no-op retile failed"), 0);
+        assert_eq!(read_flat_state(&sim), (pos.clone(), vel.clone()));
+
+        sim.write_pos_vel(&pos, &vel);
+        sim.compute_aabbs().expect("no-op AABB build failed");
+        sim.pro_que.queue().finish().expect("no-op AABB queue failed");
+        assert_eq!(sim.retile_gpu(&pairs).expect("GPU no-op retile failed"), 0);
+        assert_eq!(read_flat_state(&sim), (pos, vel));
+    }
+
+    #[test]
     fn opencl_exact_bitset_and_pathological_kernel_smoke() {
+        let _opencl = lock_opencl();
         let n = 40 * super::GROUP_SIZE;
         let mut sim = super::CollisionOcl::new(
             n,
@@ -1271,6 +1646,7 @@ mod tests {
 
     #[test]
     fn opencl_pathological_row_processes_group_39_and_preserves_input() {
+        let _opencl = lock_opencl();
         let n_groups = 40;
         let n = n_groups * super::GROUP_SIZE;
         let mut sim = super::CollisionOcl::new(n, super::GROUP_SIZE, [-20.0, -20.0, -20.0], [20.0, 20.0, 20.0], 0.1).expect("OpenCL initialization failed");
@@ -1308,6 +1684,7 @@ mod tests {
     #[test]
     #[ignore = "manual target-scale performance diagnostic"]
     fn headless_target_scale_benchmark() {
+        let _opencl = lock_opencl();
         let n = 16384;
         let mut sim = super::CollisionOcl::new(n, super::GROUP_SIZE, [-20.0, -20.0, -20.0], [20.0, 20.0, 20.0], 0.1).expect("OpenCL initialization failed");
         for _ in 0..3 {
@@ -1326,13 +1703,66 @@ mod tests {
             narrow_ms += t.elapsed().as_secs_f64() * 1000.0;
         }
         sim.compute_aabbs().unwrap(); sim.compute_overlaps().unwrap(); sim.pro_que.queue().finish().unwrap();
-        let t = std::time::Instant::now();
         let map = sim.read_group_map();
-        let mut pos: Vec<f32> = sim.read_positions().into_iter().flatten().collect();
-        let mut vel: Vec<f32> = sim.read_velocities().into_iter().flatten().collect();
-        let repaired = super::rebalance_retile(&mut pos, &mut vel, &map, super::GROUP_SIZE, n, 8);
-        if repaired > 0 { sim.write_pos_vel(&pos, &vel); sim.pro_que.queue().finish().unwrap(); }
-        let repair_ms = t.elapsed().as_secs_f64() * 1000.0;
-        println!("target-scale: broad={:.3} ms, narrow={:.3} ms, retile={} in {:.3} ms", broad_ms/10.0, narrow_ms/10.0, repaired, repair_ms);
+        let pairs = super::select_disjoint_retile_pairs(&map, 8);
+        assert!(!pairs.is_empty(), "target-scale benchmark produced no overlapping repair pairs");
+        let (base_pos, base_vel) = read_flat_state(&sim);
+
+        const REPEATS: usize = 20;
+        let mut cpu_samples = Vec::with_capacity(REPEATS);
+        let mut cpu_accepted = None;
+        for _ in 0..REPEATS {
+            sim.write_pos_vel(&base_pos, &base_vel); sim.pro_que.queue().finish().unwrap();
+            let t = std::time::Instant::now();
+            let mut cpu_pos = sim.read_positions().into_iter().flatten().collect::<Vec<f32>>();
+            let mut cpu_vel = sim.read_velocities().into_iter().flatten().collect::<Vec<f32>>();
+            let accepted = super::rebalance_retile_snapshot(&mut cpu_pos, &mut cpu_vel, &map, &pairs);
+            if accepted > 0 { sim.write_pos_vel(&cpu_pos, &cpu_vel); sim.pro_que.queue().finish().unwrap(); }
+            cpu_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            assert!(cpu_accepted.is_none() || cpu_accepted == Some(accepted));
+            cpu_accepted = Some(accepted);
+        }
+        let cpu_accepted = cpu_accepted.unwrap();
+        let cpu_state = read_flat_state(&sim);
+
+        let mut hybrid_samples = Vec::with_capacity(REPEATS);
+        let mut hybrid_accepted = None;
+        for _ in 0..REPEATS {
+            sim.write_pos_vel(&base_pos, &base_vel); sim.pro_que.queue().finish().unwrap();
+            let t = std::time::Instant::now();
+            let accepted = sim.retile_hybrid(&map, &pairs).unwrap();
+            hybrid_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            assert!(hybrid_accepted.is_none() || hybrid_accepted == Some(accepted));
+            hybrid_accepted = Some(accepted);
+        }
+        let hybrid_accepted = hybrid_accepted.unwrap();
+        let hybrid_state = read_flat_state(&sim);
+
+        let mut gpu_samples = Vec::with_capacity(REPEATS);
+        let mut gpu_accepted = None;
+        for _ in 0..REPEATS {
+            sim.write_pos_vel(&base_pos, &base_vel); sim.compute_aabbs().unwrap(); sim.pro_que.queue().finish().unwrap();
+            let t = std::time::Instant::now();
+            let accepted = sim.retile_gpu(&pairs).unwrap();
+            gpu_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            assert!(gpu_accepted.is_none() || gpu_accepted == Some(accepted));
+            gpu_accepted = Some(accepted);
+        }
+        let gpu_accepted = gpu_accepted.unwrap();
+        let gpu_state = read_flat_state(&sim);
+
+        assert_eq!((hybrid_accepted, gpu_accepted), (cpu_accepted, cpu_accepted), "backend acceptance counts differ");
+        assert_eq!(hybrid_state, cpu_state, "hybrid target-scale result differs from CPU snapshot reference");
+        assert_eq!(gpu_state, cpu_state, "GPU target-scale result differs from CPU snapshot reference");
+        let quality_before = super::compute_quality(&map.amins, &map.amaxs);
+        let (after_mins, after_maxs) = super::compute_group_aabbs_host(&cpu_state.0, sim.n_groups, super::GROUP_SIZE, n);
+        let quality_after = super::compute_quality(&after_mins, &after_maxs);
+        let stats = |samples: &[f64]| (samples.iter().sum::<f64>() / samples.len() as f64, samples.iter().copied().fold(f64::INFINITY, f64::min));
+        let (cpu_avg, cpu_min) = stats(&cpu_samples);
+        let (hybrid_avg, hybrid_min) = stats(&hybrid_samples);
+        let (gpu_avg, gpu_min) = stats(&gpu_samples);
+        println!("target-scale: broad={:.3} ms narrow={:.3} ms pairs={} accepted={} repeats={}", broad_ms/10.0, narrow_ms/10.0, pairs.len(), cpu_accepted, REPEATS);
+        println!("quality overlap/perimeter: {}/{:.3} -> {}/{:.3}", quality_before.0, quality_before.1, quality_after.0, quality_after.1);
+        println!("retile avg/min: cpu-full={:.3}/{:.3} ms hybrid={:.3}/{:.3} ms gpu={:.3}/{:.3} ms", cpu_avg, cpu_min, hybrid_avg, hybrid_min, gpu_avg, gpu_min);
     }
 }

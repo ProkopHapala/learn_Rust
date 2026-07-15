@@ -9,9 +9,10 @@ contiguous particle groups
         -> group-owned collision gathers
 ```
 
-It is not intended to be a finished physics engine. Its purpose is to make the
-cost, ownership, synchronization, and failure modes of a group-based broad
-phase visible before comparing it with the uniform-grid approach in
+It is not intended to be a finished physics engine. It is a testing and
+benchmarking platform for making the cost, ownership, synchronization, and
+failure modes of alternative group-repair backends visible before comparing
+the architecture with the uniform-grid approach in
 [`demo11_collision_grid`](../demo11_collision_grid/).
 
 ## Purpose and motivation
@@ -82,16 +83,51 @@ the CPU reads the GPU-produced map and considers only actual overlapping group
 pairs. It does not rediscover the complete group graph with a second CPU-wide
 search.
 
+## Where repair enters the frame
+
+Repair is inserted between broad phase and collision, after the map describes
+the current particle snapshot:
+
+```text
+positions
+    -> AABBs and exact map
+    -> optional interval/degree trigger
+    -> selected repair backend
+    -> rebuild AABBs/map only if particle ownership changed
+    -> collision kernels
+    -> ping-pong swap
+```
+
+With auto-rebuild disabled, the extra repair path is absent. With it enabled,
+the interval and degree trigger prevent the UI experiment from turning every
+frame into a host synchronization benchmark. Manual repair uses the same
+selected backend and then refreshes the broad-phase metadata before physics.
+
 ## Rebalancing and its interaction with physics
 
 Rebalancing is intentionally outside the normal collision kernel. Changing
 group membership while another workgroup is reading the groups would create
 duplicate, missing, or partially updated particles.
 
-The UI offers four policies:
+The UI offers seven policies. Four are closely related retile algorithms whose
+data paths can be compared directly:
 
-- `2W retile` is the default. Two neighboring groups are merged, then split
-  into two full groups using x, z, and center-line candidate partitions.
+- `CPU sequential retile` is the original full-readback reference. Accepted
+  pairs update the AABB state seen by later pairs in the same pass.
+- `CPU snapshot full-transfer` uses the parallel round semantics while still
+  reading and writing the complete particle state. It is the fair CPU baseline
+  for the hybrid and GPU backends.
+- `Hybrid staged retile` selects disjoint pairs from the GPU map, gathers only
+  their particle records, evaluates them on the CPU, and commits only the
+  compact result.
+- `GPU snapshot retile` uses the same disjoint pair plan and objective, but a
+  64-work-item OpenCL workgroup loads, sorts, evaluates, and commits each pair
+  without moving particle state to the host. The small pair plan is still
+  selected on the CPU from the GPU map; moving that tiny decision is not the
+  performance question being isolated here.
+
+The remaining policies are deliberately different repair heuristics:
+
 - `Greedy swaps` exchanges individual records between GPU-reported neighbors.
   It is cheap but can miss improvements that require several particles to move
   together.
@@ -109,6 +145,18 @@ Accepted repairs preserve exact group occupancy and keep position/velocity
 records together. Repair decisions first prefer fewer incident AABB overlaps,
 then smaller perimeter. This is closer to the actual broad-phase cost than a
 centroid-distance-only heuristic.
+
+The hybrid and GPU implementations use Jacobi-style snapshot semantics: every
+pair in a round is evaluated against the same pre-repair AABBs. This makes
+parallel decisions reproducible and race-free. It is intentionally not
+identical to the sequential CPU policy, where an earlier accepted pair can
+change a later pair's decision. The selectable CPU snapshot implementation is
+the canonical reference for hybrid/GPU parity.
+
+Snapshot independence is a computational property, not a proof of global
+optimality. Two individually improving pairs can still interact after both are
+committed. The benchmark therefore reports the global overlap/perimeter change
+instead of hiding regressions behind the accepted-pair count.
 
 ## Non-obvious context and caveats
 
@@ -130,20 +178,30 @@ and parity conditions; they are not claiming bitwise cross-device trajectory
 identity.
 
 The visualizer performs readback and CPU drawing for inspection. Those costs
-are not representative of a headless production simulation. Rebalancing still
-transfers the complete position and velocity arrays when a CPU repair is
-accepted; GPU candidate discovery has been moved to the bit map, but the final
-CPU layout mutation remains an O(N) operation.
+are not representative of a headless production simulation. The UI reports
+estimated backend state-transfer bytes so the full CPU, compact hybrid, and
+device-resident paths can be compared separately from rendering overhead.
+
+The full GPU backend is not assumed to win. A normal repair round contains at
+most 32 pair workgroups, often only a few, so launch and synchronization costs
+can exceed the saved transfer time. The hybrid path also adds gather/commit
+launches. Device type, particle count, pair count, and acceptance rate all
+matter; this is why parity-gated measurement is part of the design.
+
+The repair kernels never participate in the normal collision dispatch. This
+keeps the base physics path easy to inspect and makes it possible to compare a
+repair strategy's cost and grouping quality without quietly changing collision
+ownership or adding repair-specific branches to every particle step.
 
 ## Open issues and unfinished work
 
 The current design is a validated study implementation, not a finished
 scalable partition manager. Open work includes:
 
-- Move selected-group gathers, repartitioning, and permutation application to
-  the GPU so repairs do not require full state readback and upload.
 - Add common-pool reassignment for cyclic misplacements involving more than two
   groups.
+- Add cross-pair conflict prediction or a rollback round when snapshot-local
+  improvements degrade the rebuilt global map.
 - Unify swaps and retile into one bounded local repair algorithm.
 - Add tight center boxes and better visualization of why a group is considered
   pathological.
@@ -160,14 +218,18 @@ scalable partition manager. Open work includes:
 
 The tests cover exact overlap bits beyond 32 neighbors, symmetry and degree
 validation, CPU record preservation during retile, immutable ping-pong input,
-and an OpenCL collision whose only meaningful contact is supplied through the
-second bitset word.
+an OpenCL collision whose only meaningful contact is supplied through the
+second bitset word, and exact CPU/hybrid/GPU snapshot-retile parity. The parity
+fixtures cover both accepted multi-pair repair and rejected no-op behavior,
+including exact particle-ID permutation and position/velocity record identity.
 
-The ignored headless benchmark measures broad phase, narrow phase, and one
-GPU-map-driven repair at target scale:
+The ignored release benchmark measures broad phase and narrow phase, then runs
+the same disjoint pair plan repeatedly through full-transfer CPU, compact
+hybrid, and device-resident GPU backends. It checks exact final-state parity
+before reporting average/minimum timings:
 
 ```bash
-cargo test -p demo10_collision_balls headless_target_scale_benchmark -- --ignored --nocapture
+cargo test --release -p demo10_collision_balls headless_target_scale_benchmark -- --ignored --nocapture
 ```
 
 For architectural comparison, see

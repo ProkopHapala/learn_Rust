@@ -1,8 +1,14 @@
 //! demo11_collision_grid — OpenCL particle collision simulation with a uniform grid.
 //!
-//! The grid is rebuilt every frame. Particles are compacted into cell-contiguous
-//! arrays, and each particle gathers contacts from the surrounding 3x3 cells.
-//! The collision kernel reads one state snapshot and writes a separate snapshot.
+//! This demo is the scalable comparison baseline for demo10's fixed group
+//! partition. It rebuilds a bounded spatial index on the GPU, compacts all
+//! associated particle records together, and lets each destination particle
+//! gather from the surrounding 3x3 cells.
+//!
+//! The extra rebuild/scatter work is intentional: ownership is explicit,
+//! crowded cells have no silent fixed-capacity overflow, and the resulting
+//! timings can be compared against demo10's group-repair strategies. The
+//! collision step still reads one immutable snapshot and writes another.
 
 use eframe::egui;
 use ocl::{flags, Buffer, Kernel, ProQue};

@@ -1,18 +1,35 @@
-// Uniform-grid kernels for the particle-cell collision demo.
-//
-// The grid is dense and bounded. Particles are compacted into cell-contiguous
-// arrays, then each destination particle gathers contacts from the 3x3 stencil.
-// The collision kernel reads one immutable state and writes a separate state.
+/// @file collision_kernel.cl
+/// @brief GPU construction and particle-gather kernels for the uniform-grid baseline.
+///
+/// This demo is the comparison point for demo10's fixed group partition. A
+/// dense bounded grid is rebuilt from the current snapshot, particles are made
+/// contiguous by cell, and each destination particle gathers contacts from its
+/// own cell plus the eight neighbors. The grid is an index, not a PIC field:
+/// no particle quantity is deposited or interpolated.
+///
+/// The design intentionally accepts a rebuild and integer scatter each frame
+/// in exchange for simple ownership and a compact, capacity-free cell layout.
+/// The collision kernel then reads one immutable sorted snapshot and writes a
+/// separate snapshot, because OpenCL workgroups have no general global barrier.
+///
+/// === AUTO-DOC BEGIN ===
+/// Key invariant: cell offsets/counts describe the same sorted position,
+/// velocity, ID, and key arrays. The ID buffer is the parity/debug witness.
+/// === AUTO-DOC END ===
 
 #define SCAN_W 256
 #define SCAN_ELEMS (2 * SCAN_W)
 #define CONTACT_EPS2 1.0e-12f
 
+/// @brief Clear a compact metadata array before the next construction phase.
 __kernel void clear_uint(__global uint* values, const uint value, const int n) {
     int i = get_global_id(0);
     if (i < n) values[i] = value;
 }
 
+/// @brief Reset cell counts and scatter cursors for a new grid build.
+/// Both are separate because counts define
+/// final ranges while cursors are consumed by the unordered particle scatter.
 __kernel void clear_cell_buffers(
     __global uint* cell_count,
     __global uint* cell_cursor,
@@ -25,6 +42,10 @@ __kernel void clear_cell_buffers(
     }
 }
 
+/// @brief Assign each particle to a bounded cell and count occupancy.
+/// The atomic is
+/// acceptable here because it occurs during index construction; collision
+/// response remains particle-owned and atomic-free.
 __kernel void compute_cell_keys_and_count(
     __global const float4* pos,
     __global uint* cell_key,
@@ -49,8 +70,9 @@ __kernel void compute_cell_keys_and_count(
     atomic_inc((volatile __global uint*)&cell_count[cell]);
 }
 
-// One workgroup scans 2*SCAN_W values and writes one sum for that block.
-// The host launches a hierarchy of these scans for the cell-count array.
+/// @brief Scan one block and emit its total.
+/// The host launches a hierarchy because a
+/// workgroup-local barrier cannot synchronize the whole cell-count array.
 __kernel void scan_block(
     __global const uint* input,
     __global uint* output,
@@ -94,6 +116,7 @@ __kernel void scan_block(
     if (i1 < n) output[i1] = temp[2 * lid + 1];
 }
 
+/// @brief Add scanned block totals to form global cell offsets.
 __kernel void add_block_offsets(
     __global uint* values,
     __global const uint* block_offsets,
@@ -103,6 +126,10 @@ __kernel void add_block_offsets(
     if (i < n) values[i] += block_offsets[i / SCAN_ELEMS];
 }
 
+/// @brief Compact all particle records into cell-contiguous ranges.
+/// The atomic cursor
+/// chooses a unique slot, while writing every associated array together keeps
+/// sorted ranges and IDs aligned.
 __kernel void scatter_particles(
     __global const float4* pos_in,
     __global const float4* vel_in,
@@ -128,6 +155,10 @@ __kernel void scatter_particles(
     sorted_key[dst] = cell;
 }
 
+/// @brief Gather collision response over the particle's 3x3 cell stencil.
+/// Each work-item
+/// owns one destination record, so no force atomics or cross-workgroup output
+/// ownership are needed; the ID output preserves the permutation for tests.
 __kernel void collision_step(
     __global const float4* pos_in,
     __global const float4* vel_in,

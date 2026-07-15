@@ -10,6 +10,13 @@ particle checks only its own cell and the eight neighboring cells. The grid is
 therefore a broad-phase accelerator: it reduces the number of pairs that need
 to be considered, but it does not decide the final collision response.
 
+Together with demo10, this is an experiment about where spatial organization
+should live. Demo10 keeps a fixed group layout and measures the cost of
+repairing ownership; demo11 rebuilds the organization every frame and measures
+the cost of a uniform index. Neither layout is declared universally optimal:
+the useful comparison is how their costs change with density, clustering, and
+motion.
+
 This is sometimes called a PIC-style grid in informal discussions, but this
 program is not a classical particle-in-cell field solver. It does not deposit
 particle quantities onto a grid or interpolate a grid field back to particles.
@@ -39,6 +46,11 @@ The important trade-off is deliberate: this version spends work rebuilding a
 correct neighbor index every frame in exchange for simple ownership and clear
 validation. It is a reference point for later measurements such as Verlet
 lists, radix sorting, or occupancy-specialized kernels.
+
+The OpenCL header mirrors these principles. Its scan, count, and scatter stages
+belong to index construction; the collision kernel is a separate immutable-
+snapshot gather. Keeping those responsibilities distinct makes it possible to
+attribute a slowdown to grid construction, compaction, or contact evaluation.
 
 ## Frame interaction
 
